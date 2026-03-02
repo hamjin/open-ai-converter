@@ -114,7 +114,7 @@ docker run -d --name openai-converter \
 
 | 变量名 | 说明 | 默认值 |
 |---|---|---|
-| `RESPONSES_API_BASE_URL` | 上游 Responses API 地址（方向1的目标） | `https://codex.viloze.com` |
+| `RESPONSES_API_BASE_URL` | 上游 Responses API 地址（方向1的目标） | `https://api.openai.com` |
 | `RESPONSES_API_KEY` | 上游 Responses API 密钥 | — |
 | `COMPLETIONS_API_BASE_URL` | 上游 Chat Completions API 地址（方向2的目标） | `https://api.openai.com` |
 | `COMPLETIONS_API_KEY` | 上游 Chat Completions API 密钥 | — |
@@ -442,6 +442,42 @@ assistant tool_calls → function_call (type: function_call)
 tool message         → function_call_output (type: function_call_output)
 ```
 
+### 多轮对话
+
+#### Chat Completions 侧
+
+```bash
+curl http://localhost:9090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4.1-nano",
+    "messages": [
+      {"role": "user", "content": "My name is Alice."},
+      {"role": "assistant", "content": "Hello Alice! How can I help you?"},
+      {"role": "user", "content": "What is my name?"}
+    ]
+  }'
+```
+
+代理自动将历史 assistant 消息转换为 Responses API 的 `type: message` 格式（包含 `output_text` 内容数组），确保多轮对话上下文正确传递。
+
+#### Responses 侧
+
+```bash
+curl http://localhost:9090/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4.1-nano",
+    "input": [
+      {"role": "user", "content": "My name is Alice."},
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello Alice! How can I help you?"}]},
+      {"role": "user", "content": "What is my name?"}
+    ]
+  }'
+```
+
+代理自动将 Responses API 的 assistant 消息（含 `output_text` 数组）转换为 Chat Completions 的 `{"role": "assistant", "content": "..."}` 格式。
+
 ### Reasoning（推理控制）
 
 ```bash
@@ -583,11 +619,15 @@ instructions        →  { role: "system", content: ... }
 ```
 OPENAI_CONVERTER/
 ├── .env              # 环境变量配置
+├── .env.example      # 环境变量示例
+├── .gitlab-ci.yml    # GitLab CI/CD（多平台构建 & 容器发布）
 ├── go.mod            # Go 模块定义（零外部依赖）
 ├── main.go           # 入口、路由、中间件（CORS/日志）、.env 加载
 ├── types.go          # 全部类型定义（Chat Completions & Responses API）
 ├── convert.go        # 核心双向转换逻辑（请求/响应/Vision/Schema/Reasoning）
 ├── handler.go        # HTTP 处理器 & 流式 SSE 转换
+├── Dockerfile        # 多阶段构建（golang:1.23-alpine → alpine:3.19）
+├── docker-compose.yml # Docker Compose 编排
 └── README.md         # 本文件
 ```
 
@@ -628,6 +668,23 @@ OPENAI_CONVERTER/
   }
 }
 ```
+
+## Changelog
+
+### v1.1.0
+
+- **fix**: 修复多轮对话在第二轮请求时失败的问题（assistant 消息格式修正为 `type: message` + `output_text` 数组）
+- **fix**: 修复 `contentToString` 对 `null` 内容的处理
+- **build**: Docker Compose 端口支持通过 `PORT` 环境变量动态配置
+- **ci**: 新增 Container Registry 推送（`registry.gitlab.com/viloze/open-ai-converter`）
+
+### v1.0.0
+
+- 初始版本
+- 双向转换 Chat Completions ↔ Responses API（流式 & 非流式）
+- Vision、Structured Output、Reasoning、Tool Calling、Refusal、Logprobs 完整支持
+- GitLab CI/CD 多平台构建（linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64）
+- Docker 多架构镜像发布
 
 ## License
 
