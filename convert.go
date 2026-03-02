@@ -37,9 +37,13 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 			if len(msg.ToolCalls) > 0 {
 				text := contentToString(msg.Content)
 				if text != "" {
+					// Assistant message with text content → Responses API "message" item
 					inputMessages = append(inputMessages, map[string]interface{}{
-						"role":    "assistant",
-						"content": text,
+						"type": "message",
+						"role": "assistant",
+						"content": []map[string]interface{}{
+							{"type": "output_text", "text": text},
+						},
 					})
 				}
 				for _, tc := range msg.ToolCalls {
@@ -53,13 +57,14 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 					})
 				}
 			} else {
+				// Assistant message without tool_calls → Responses API "message" item
+				text := contentToString(msg.Content)
 				m := map[string]interface{}{
+					"type": "message",
 					"role": "assistant",
-				}
-				if msg.Content != nil {
-					var raw interface{}
-					json.Unmarshal(msg.Content, &raw)
-					m["content"] = raw
+					"content": []map[string]interface{}{
+						{"type": "output_text", "text": text},
+					},
 				}
 				inputMessages = append(inputMessages, m)
 			}

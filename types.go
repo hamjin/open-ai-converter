@@ -325,7 +325,7 @@ func jsonString(s string) json.RawMessage {
 }
 
 func contentToString(raw json.RawMessage) string {
-	if raw == nil {
+	if raw == nil || string(raw) == "null" {
 		return ""
 	}
 	var s string
