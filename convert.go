@@ -39,10 +39,11 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 				if text != "" {
 					// Assistant message with text content → Responses API "message" item
 					inputMessages = append(inputMessages, map[string]interface{}{
-						"type": "message",
-						"role": "assistant",
+						"type":   "message",
+						"role":   "assistant",
+						"status": "completed",
 						"content": []map[string]interface{}{
-							{"type": "output_text", "text": text},
+							{"type": "output_text", "text": text, "annotations": []interface{}{}},
 						},
 					})
 				}
@@ -60,10 +61,11 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 				// Assistant message without tool_calls → Responses API "message" item
 				text := contentToString(msg.Content)
 				m := map[string]interface{}{
-					"type": "message",
-					"role": "assistant",
+					"type":   "message",
+					"role":   "assistant",
+					"status": "completed",
 					"content": []map[string]interface{}{
-						{"type": "output_text", "text": text},
+						{"type": "output_text", "text": text, "annotations": []interface{}{}},
 					},
 				}
 				inputMessages = append(inputMessages, m)

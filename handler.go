@@ -41,7 +41,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[chat→resp] converted body: %s", truncateLog(string(respBody), 500))
+	log.Printf("[chat→resp] converted body: %s", truncateLog(string(respBody), 2000))
 
 	upstreamURL := cfg.ResponsesAPIBaseURL + "/v1/responses"
 
@@ -67,6 +67,7 @@ func handleChatNonStream(w http.ResponseWriter, url, apiKey string, reqBody []by
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("[chat→resp] upstream error %d: %s", resp.StatusCode, truncateLog(string(respBody), 1000))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
