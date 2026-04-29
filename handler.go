@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -47,14 +48,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := cfg.ResponsesAPIBaseURL + "/v1/responses"
 
 	if chatReq.Stream {
-		handleChatStreamViaResponses(w, upstreamURL, apiKey, respBody, chatReq.Model)
+		handleChatStreamViaResponses(r, w, upstreamURL, apiKey, respBody, chatReq.Model)
 	} else {
-		handleChatNonStream(w, upstreamURL, apiKey, respBody)
+		handleChatNonStream(r, w, upstreamURL, apiKey, respBody)
 	}
 }
 
-func handleChatNonStream(w http.ResponseWriter, url, apiKey string, reqBody []byte) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody, false)
+func handleChatNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte) {
+	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -91,8 +92,8 @@ func handleChatNonStream(w http.ResponseWriter, url, apiKey string, reqBody []by
 	json.NewEncoder(w).Encode(chatResp)
 }
 
-func handleChatStreamViaResponses(w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody, true)
+func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
+	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -352,14 +353,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
 
 	if respReq.Stream {
-		handleResponsesStreamViaChat(w, upstreamURL, apiKey, chatBody, respReq.Model)
+		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, respReq.Model)
 	} else {
-		handleResponsesNonStream(w, upstreamURL, apiKey, chatBody)
+		handleResponsesNonStream(r, w, upstreamURL, apiKey, chatBody)
 	}
 }
 
-func handleResponsesNonStream(w http.ResponseWriter, url, apiKey string, reqBody []byte) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody, false)
+func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte) {
+	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -395,8 +396,8 @@ func handleResponsesNonStream(w http.ResponseWriter, url, apiKey string, reqBody
 	json.NewEncoder(w).Encode(responsesResp)
 }
 
-func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody, true)
+func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
+	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -875,6 +876,26 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Content-Type", ct)
 	}
 
+	// Forward client IP via X-Forwarded-For and X-Real-IP
+	clientIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+		if !isPrivateOrLoopback(clientIP) {
+			req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+		} else {
+			req.Header.Set("X-Forwarded-For", prior)
+		}
+	} else if !isPrivateOrLoopback(clientIP) {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		req.Header.Set("X-Real-IP", realIP)
+	} else if !isPrivateOrLoopback(clientIP) {
+		req.Header.Set("X-Real-IP", clientIP)
+	}
+
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -897,7 +918,16 @@ var httpClient = &http.Client{
 	Timeout: 5 * time.Minute,
 }
 
-func doUpstreamRequest(url, apiKey string, body []byte, streaming bool) (*http.Response, error) {
+// isPrivateOrLoopback checks if an IP address is a private/loopback address.
+func isPrivateOrLoopback(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback()
+}
+
+func doUpstreamRequest(origReq *http.Request, url, apiKey string, body []byte, streaming bool) (*http.Response, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -908,6 +938,28 @@ func doUpstreamRequest(url, apiKey string, body []byte, streaming bool) (*http.R
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
+	}
+
+	// Forward client IP via X-Forwarded-For and X-Real-IP
+	if origReq != nil {
+		clientIP := origReq.RemoteAddr
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
+		}
+		if prior := origReq.Header.Get("X-Forwarded-For"); prior != "" {
+			if !isPrivateOrLoopback(clientIP) {
+				req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+			} else {
+				req.Header.Set("X-Forwarded-For", prior)
+			}
+		} else if !isPrivateOrLoopback(clientIP) {
+			req.Header.Set("X-Forwarded-For", clientIP)
+		}
+		if realIP := origReq.Header.Get("X-Real-IP"); realIP != "" {
+			req.Header.Set("X-Real-IP", realIP)
+		} else if !isPrivateOrLoopback(clientIP) {
+			req.Header.Set("X-Real-IP", clientIP)
+		}
 	}
 
 	log.Printf("[upstream] POST %s (%d bytes) streaming=%v", url, len(body), streaming)
