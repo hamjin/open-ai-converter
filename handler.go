@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -53,7 +54,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleChatNonStream(w http.ResponseWriter, url, apiKey string, reqBody []byte) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody)
+	resp, err := doUpstreamRequest(url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -91,7 +92,7 @@ func handleChatNonStream(w http.ResponseWriter, url, apiKey string, reqBody []by
 }
 
 func handleChatStreamViaResponses(w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody)
+	resp, err := doUpstreamRequest(url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -109,6 +110,45 @@ func handleChatStreamViaResponses(w http.ResponseWriter, url, apiKey string, req
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	// Fallback: if upstream returned JSON instead of SSE, convert to streaming chunks
+	contentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "application/json") {
+		respBody, _ := io.ReadAll(resp.Body)
+		var respResp ResponsesResponse
+		if err := json.Unmarshal(respBody, &respResp); err == nil {
+			chatResp, err := ConvertResponsesRespToChatResp(&respResp)
+			if err == nil {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+				w.Header().Set("X-Accel-Buffering", "no")
+				w.WriteHeader(http.StatusOK)
+
+				chatResp.Object = "chat.completion.chunk"
+				for i := range chatResp.Choices {
+					if chatResp.Choices[i].Message != nil {
+						delta := &ChatDelta{
+							Role:      "assistant",
+							ToolCalls: chatResp.Choices[i].Message.ToolCalls,
+							Refusal:   chatResp.Choices[i].Message.Refusal,
+						}
+						text := contentToString(chatResp.Choices[i].Message.Content)
+						if text != "" {
+							delta.Content = &text
+						}
+						chatResp.Choices[i].Delta = delta
+						chatResp.Choices[i].Message = nil
+					}
+				}
+				writeSSEChunk(w, chatResp)
+				flusher.Flush()
+			}
+		}
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
 		return
 	}
 
@@ -319,7 +359,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleResponsesNonStream(w http.ResponseWriter, url, apiKey string, reqBody []byte) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody)
+	resp, err := doUpstreamRequest(url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -356,7 +396,7 @@ func handleResponsesNonStream(w http.ResponseWriter, url, apiKey string, reqBody
 }
 
 func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
-	resp, err := doUpstreamRequest(url, apiKey, reqBody)
+	resp, err := doUpstreamRequest(url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
@@ -374,6 +414,63 @@ func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, req
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	// Fallback: if upstream returned JSON instead of SSE, convert to Responses SSE events
+	upstreamContentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(upstreamContentType, "application/json") {
+		respBody, _ := io.ReadAll(resp.Body)
+		var chatResp ChatCompletionsResponse
+		if err := json.Unmarshal(respBody, &chatResp); err == nil {
+			responsesResp, err := ConvertChatRespToResponsesResp(&chatResp)
+			if err == nil {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+				w.Header().Set("X-Accel-Buffering", "no")
+				w.WriteHeader(http.StatusOK)
+
+				seqNum := 0
+				responseID := generateID("resp_")
+				baseResponse := map[string]interface{}{
+					"id": responseID, "object": "response", "created_at": responsesResp.CreatedAt,
+					"status": responsesResp.Status, "model": model, "output": []interface{}{},
+				}
+				writeResponsesSSE(w, "response.created", map[string]interface{}{
+					"type": "response.created", "response": baseResponse, "sequence_number": seqNum,
+				})
+				flusher.Flush()
+				seqNum++
+				writeResponsesSSE(w, "response.in_progress", map[string]interface{}{
+					"type": "response.in_progress", "response": baseResponse, "sequence_number": seqNum,
+				})
+				flusher.Flush()
+				seqNum++
+
+				var outputItems []interface{}
+				for _, item := range responsesResp.Output {
+					outputItems = append(outputItems, item)
+				}
+
+				completedResponse := map[string]interface{}{
+					"id": responseID, "object": "response", "created_at": responsesResp.CreatedAt,
+					"status": responsesResp.Status, "completed_at": time.Now().Unix(),
+					"model": model, "output": outputItems,
+				}
+				if responsesResp.Usage != nil {
+					completedResponse["usage"] = map[string]interface{}{
+						"input_tokens":  responsesResp.Usage.InputTokens,
+						"output_tokens": responsesResp.Usage.OutputTokens,
+						"total_tokens":  responsesResp.Usage.TotalTokens,
+					}
+				}
+				writeResponsesSSE(w, "response.completed", map[string]interface{}{
+					"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
+				})
+				flusher.Flush()
+			}
+		}
 		return
 	}
 
@@ -411,38 +508,18 @@ func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, req
 	flusher.Flush()
 	seqNum++
 
-	// output_item.added (message)
-	writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-		"type": "response.output_item.added", "output_index": 0,
-		"item": map[string]interface{}{
-			"id": msgID, "type": "message", "status": "in_progress",
-			"content": []interface{}{}, "role": "assistant",
-		},
-		"sequence_number": seqNum,
-	})
-	flusher.Flush()
-	seqNum++
-
-	// content_part.added
-	writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
-		"type": "response.content_part.added", "content_index": 0,
-		"item_id": msgID, "output_index": 0,
-		"part": map[string]interface{}{
-			"type": "output_text", "annotations": []interface{}{}, "text": "",
-		},
-		"sequence_number": seqNum,
-	})
-	flusher.Flush()
-	seqNum++
-
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var fullText strings.Builder
+	var fullRefusal strings.Builder
 	var chatUsage *ChatUsage
 	var toolCalls []ToolCall
 	toolCallMap := make(map[int]*ToolCall)
 	var finishReason string
+	var finishReasonSeen bool
+	var contentPartAdded bool
+	var contentType string // "output_text" or "refusal"
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -469,11 +546,36 @@ func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, req
 
 		choice := chunk.Choices[0]
 
-		if choice.Delta != nil {
+		if choice.Delta != nil && !finishReasonSeen {
 			// Text content
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				delta := *choice.Delta.Content
 				fullText.WriteString(delta)
+
+				if !contentPartAdded {
+					contentPartAdded = true
+					contentType = "output_text"
+					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added", "output_index": 0,
+						"item": map[string]interface{}{
+							"id": msgID, "type": "message", "status": "in_progress",
+							"content": []interface{}{}, "role": "assistant",
+						},
+						"sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
+						"type": "response.content_part.added", "content_index": 0,
+						"item_id": msgID, "output_index": 0,
+						"part": map[string]interface{}{
+							"type": "output_text", "annotations": []interface{}{}, "text": "",
+						},
+						"sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+				}
 
 				writeResponsesSSE(w, "response.output_text.delta", map[string]interface{}{
 					"type": "response.output_text.delta", "content_index": 0,
@@ -486,10 +588,38 @@ func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, req
 
 			// Refusal
 			if choice.Delta.Refusal != nil && *choice.Delta.Refusal != "" {
+				refusalDelta := *choice.Delta.Refusal
+				fullRefusal.WriteString(refusalDelta)
+
+				if !contentPartAdded {
+					contentPartAdded = true
+					contentType = "refusal"
+					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added", "output_index": 0,
+						"item": map[string]interface{}{
+							"id": msgID, "type": "message", "status": "in_progress",
+							"content": []interface{}{}, "role": "assistant",
+						},
+						"sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
+						"type": "response.content_part.added", "content_index": 0,
+						"item_id": msgID, "output_index": 0,
+						"part": map[string]interface{}{
+							"type": "refusal", "refusal": "",
+						},
+						"sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+				}
+
 				writeResponsesSSE(w, "response.refusal.delta", map[string]interface{}{
 					"type": "response.refusal.delta", "content_index": 0,
 					"item_id": msgID, "output_index": 0,
-					"delta": *choice.Delta.Refusal, "sequence_number": seqNum,
+					"delta": refusalDelta, "sequence_number": seqNum,
 				})
 				flusher.Flush()
 				seqNum++
@@ -548,12 +678,20 @@ func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, req
 
 		if choice.FinishReason != nil {
 			finishReason = *choice.FinishReason
-			break
+			finishReasonSeen = true
+			continue
 		}
 	}
 
-	// Finalize tool calls
-	for idx, tc := range toolCallMap {
+	// Finalize tool calls in deterministic order
+	toolCallIndices := make([]int, 0, len(toolCallMap))
+	for idx := range toolCallMap {
+		toolCallIndices = append(toolCallIndices, idx)
+	}
+	sort.Ints(toolCallIndices)
+
+	for _, idx := range toolCallIndices {
+		tc := toolCallMap[idx]
 		toolCalls = append(toolCalls, *tc)
 
 		writeResponsesSSE(w, "response.function_call_arguments.done", map[string]interface{}{
@@ -576,49 +714,92 @@ func handleResponsesStreamViaChat(w http.ResponseWriter, url, apiKey string, req
 		seqNum++
 	}
 
-	// output_text.done
-	writeResponsesSSE(w, "response.output_text.done", map[string]interface{}{
-		"type": "response.output_text.done", "content_index": 0,
-		"item_id": msgID, "output_index": 0,
-		"text": fullText.String(), "sequence_number": seqNum,
-	})
-	flusher.Flush()
-	seqNum++
+	// Finalize message content (conditional on whether content was emitted)
+	if contentPartAdded {
+		if contentType == "refusal" {
+			// refusal.done
+			writeResponsesSSE(w, "response.refusal.done", map[string]interface{}{
+				"type": "response.refusal.done", "content_index": 0,
+				"item_id": msgID, "output_index": 0,
+				"refusal": fullRefusal.String(), "sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
 
-	// content_part.done
-	writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
-		"type": "response.content_part.done", "content_index": 0,
-		"item_id": msgID, "output_index": 0,
-		"part": map[string]interface{}{
-			"type": "output_text", "annotations": []interface{}{}, "text": fullText.String(),
-		},
-		"sequence_number": seqNum,
-	})
-	flusher.Flush()
-	seqNum++
+			// content_part.done (refusal)
+			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
+				"type": "response.content_part.done", "content_index": 0,
+				"item_id": msgID, "output_index": 0,
+				"part": map[string]interface{}{
+					"type": "refusal", "refusal": fullRefusal.String(),
+				},
+				"sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
+		} else {
+			// output_text.done
+			writeResponsesSSE(w, "response.output_text.done", map[string]interface{}{
+				"type": "response.output_text.done", "content_index": 0,
+				"item_id": msgID, "output_index": 0,
+				"text": fullText.String(), "sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
 
-	// output_item.done (message)
-	writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-		"type": "response.output_item.done", "output_index": 0,
-		"item": map[string]interface{}{
-			"id": msgID, "type": "message", "status": "completed", "role": "assistant",
-			"content": []map[string]interface{}{
+			// content_part.done (output_text)
+			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
+				"type": "response.content_part.done", "content_index": 0,
+				"item_id": msgID, "output_index": 0,
+				"part": map[string]interface{}{
+					"type": "output_text", "annotations": []interface{}{}, "text": fullText.String(),
+				},
+				"sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
+		}
+
+		// output_item.done (message)
+		var msgContent []map[string]interface{}
+		if contentType == "refusal" {
+			msgContent = []map[string]interface{}{
+				{"type": "refusal", "refusal": fullRefusal.String()},
+			}
+		} else {
+			msgContent = []map[string]interface{}{
 				{"type": "output_text", "annotations": []interface{}{}, "text": fullText.String()},
+			}
+		}
+		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
+			"type": "response.output_item.done", "output_index": 0,
+			"item": map[string]interface{}{
+				"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+				"content": msgContent,
 			},
-		},
-		"sequence_number": seqNum,
-	})
-	flusher.Flush()
-	seqNum++
+			"sequence_number": seqNum,
+		})
+		flusher.Flush()
+		seqNum++
+	}
 
 	// Build final output
-	outputItems := []interface{}{
-		map[string]interface{}{
-			"id": msgID, "type": "message", "status": "completed", "role": "assistant",
-			"content": []map[string]interface{}{
+	var outputItems []interface{}
+	if contentPartAdded {
+		var msgContent []map[string]interface{}
+		if contentType == "refusal" {
+			msgContent = []map[string]interface{}{
+				{"type": "refusal", "refusal": fullRefusal.String()},
+			}
+		} else {
+			msgContent = []map[string]interface{}{
 				{"type": "output_text", "annotations": []interface{}{}, "text": fullText.String()},
-			},
-		},
+			}
+		}
+		outputItems = append(outputItems, map[string]interface{}{
+			"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+			"content": msgContent,
+		})
 	}
 	for _, tc := range toolCalls {
 		outputItems = append(outputItems, map[string]interface{}{
@@ -716,16 +897,20 @@ var httpClient = &http.Client{
 	Timeout: 5 * time.Minute,
 }
 
-func doUpstreamRequest(url, apiKey string, body []byte) (*http.Response, error) {
+func doUpstreamRequest(url, apiKey string, body []byte, streaming bool) (*http.Response, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Accept", "text/event-stream")
+	if streaming {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
 
-	log.Printf("[upstream] POST %s (%d bytes)", url, len(body))
+	log.Printf("[upstream] POST %s (%d bytes) streaming=%v", url, len(body), streaming)
 	return httpClient.Do(req)
 }
 

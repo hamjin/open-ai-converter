@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,13 +18,15 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 
 	// Convert messages → input
 	var inputMessages []map[string]interface{}
-	var instructions *string
+	var instructionsParts []string
 
 	for _, msg := range chatReq.Messages {
 		switch msg.Role {
 		case "system", "developer":
 			text := contentToString(msg.Content)
-			instructions = &text
+			if text != "" {
+				instructionsParts = append(instructionsParts, text)
+			}
 
 		case "user":
 			m := map[string]interface{}{
@@ -34,12 +38,13 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 			inputMessages = append(inputMessages, m)
 
 		case "assistant":
-			if len(msg.ToolCalls) > 0 {
+			if msg.ToolCalls != nil {
 				text := contentToString(msg.Content)
 				if text != "" {
 					// Assistant message with text content → Responses API "message" item
 					inputMessages = append(inputMessages, map[string]interface{}{
 						"type":   "message",
+						"id":     generateID("msg_"),
 						"role":   "assistant",
 						"status": "completed",
 						"content": []map[string]interface{}{
@@ -62,6 +67,7 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 				text := contentToString(msg.Content)
 				m := map[string]interface{}{
 					"type":   "message",
+					"id":     generateID("msg_"),
 					"role":   "assistant",
 					"status": "completed",
 					"content": []map[string]interface{}{
@@ -82,8 +88,8 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 
 	respReq["input"] = inputMessages
 
-	if instructions != nil {
-		respReq["instructions"] = *instructions
+	if len(instructionsParts) > 0 {
+		respReq["instructions"] = strings.Join(instructionsParts, "\n\n")
 	}
 
 	// ---- Parameter mapping ----
@@ -98,6 +104,12 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 	if chatReq.Temperature != nil {
 		respReq["temperature"] = *chatReq.Temperature
 	}
+
+	// n parameter: Responses API only supports single output
+	if chatReq.N != nil && *chatReq.N > 1 {
+		log.Printf("[chat->resp] WARNING: n=%d requested but Responses API only supports 1 output", *chatReq.N)
+	}
+
 	if chatReq.TopP != nil {
 		respReq["top_p"] = *chatReq.TopP
 	}
@@ -151,7 +163,9 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 
 	// response_format → text.format
 	if chatReq.ResponseFormat != nil {
-		respReq["text"] = convertResponseFormatToText(chatReq.ResponseFormat)
+		if text := convertResponseFormatToText(chatReq.ResponseFormat); text != nil {
+			respReq["text"] = text
+		}
 	}
 
 	// parallel_tool_calls
@@ -191,6 +205,20 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 
 	if chatReq.User != nil {
 		respReq["user"] = *chatReq.User
+	}
+
+	// stream_options: pass through for streaming requests
+	if chatReq.Stream {
+		if chatReq.StreamOptions != nil {
+			respReq["stream_options"] = map[string]interface{}{
+				"include_usage": chatReq.StreamOptions.IncludeUsage,
+			}
+		} else {
+			// Auto-enable usage for streaming to ensure final chunk has usage data
+			respReq["stream_options"] = map[string]interface{}{
+				"include_usage": true,
+			}
+		}
 	}
 
 	return json.Marshal(respReq)
@@ -347,11 +375,25 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 						messages = append(messages, m)
 
 					default:
+						role := im.Role
+						if role == "" {
+							role = "assistant"
+						}
 						m := map[string]interface{}{
-							"role": im.Role,
+							"role": role,
 						}
 						if im.Content != nil {
 							m["content"] = convertResponsesContentToChat(im.Content)
+							// Extract refusal from content parts
+							var parts []ResponsesContentPart
+							if err := json.Unmarshal(im.Content, &parts); err == nil {
+								for _, p := range parts {
+									if p.Type == "refusal" && p.Refusal != "" {
+										m["refusal"] = p.Refusal
+										break
+									}
+								}
+							}
 						}
 						messages = append(messages, m)
 					}
@@ -414,7 +456,9 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 
 	// text.format → response_format
 	if respReq.Text != nil {
-		chatReq["response_format"] = convertTextToResponseFormat(respReq.Text)
+		if rf := convertTextToResponseFormat(respReq.Text); rf != nil {
+			chatReq["response_format"] = rf
+		}
 	}
 
 	// parallel_tool_calls
@@ -442,12 +486,50 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 						fn["description"] = desc
 					}
 					if params, ok := rt["parameters"]; ok {
+						// Extract strict from parameters if present (robustness)
+						if paramsMap, ok := params.(map[string]interface{}); ok {
+							if s, ok := paramsMap["strict"]; ok {
+								fn["strict"] = s
+								delete(paramsMap, "strict")
+							}
+						}
 						fn["parameters"] = params
 					}
 					if strict, ok := rt["strict"]; ok {
 						fn["strict"] = strict
 					}
 					chatTools = append(chatTools, ct)
+					case "namespace":
+						// Flatten namespace tools (e.g., MCP) with prefixed names
+						nsName, _ := rt["name"].(string)
+						var nsTools []map[string]interface{}
+						if raw, ok := rt["tools"]; ok {
+							b, _ := json.Marshal(raw)
+							json.Unmarshal(b, &nsTools)
+						}
+						for _, nt := range nsTools {
+							ntType, _ := nt["type"].(string)
+							if ntType != "function" {
+								continue
+							}
+							ct := map[string]interface{}{
+								"type": "function",
+								"function": map[string]interface{}{
+									"name": nsName + nt["name"].(string),
+								},
+							}
+							fn := ct["function"].(map[string]interface{})
+							if desc, ok := nt["description"]; ok {
+								fn["description"] = desc
+							}
+							if params, ok := nt["parameters"]; ok {
+								fn["parameters"] = params
+							}
+							if strict, ok := nt["strict"]; ok {
+								fn["strict"] = strict
+							}
+							chatTools = append(chatTools, ct)
+						}
 					// web_search, file_search, code_interpreter, computer_use
 					// cannot be mapped to Chat Completions — silently skip
 				}
@@ -501,8 +583,9 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 		}
 
 		// Add message output item
-		if msg.Content != nil || len(msg.ToolCalls) == 0 {
-			text := contentToString(msg.Content)
+		text := contentToString(msg.Content)
+		hasText := text != ""
+		if hasText || len(msg.ToolCalls) == 0 {
 			outputItem := OutputItem{
 				ID:     fmt.Sprintf("msg_%d", time.Now().UnixNano()),
 				Type:   "message",
@@ -639,7 +722,7 @@ func convertResponsesContentToChat(raw json.RawMessage) interface{} {
 		var result []map[string]interface{}
 		for _, p := range parts {
 			switch p.Type {
-			case "input_text":
+			case "input_text", "output_text", "text":
 				result = append(result, map[string]interface{}{
 					"type": "text",
 					"text": p.Text,
@@ -655,16 +738,20 @@ func convertResponsesContentToChat(raw json.RawMessage) interface{} {
 					img["image_url"].(map[string]interface{})["detail"] = p.Detail
 				}
 				result = append(result, img)
-			case "text":
-				result = append(result, map[string]interface{}{
-					"type": "text",
-					"text": p.Text,
-				})
-			default:
-				var raw2 map[string]interface{}
-				b, _ := json.Marshal(p)
-				json.Unmarshal(b, &raw2)
-				result = append(result, raw2)
+				case "refusal":
+					refusalText := p.Refusal
+					if refusalText == "" {
+						refusalText = p.Text
+					}
+					result = append(result, map[string]interface{}{
+						"type":    "refusal",
+						"refusal": refusalText,
+					})
+				default:
+					var unknown map[string]interface{}
+					b, _ := json.Marshal(p)
+					json.Unmarshal(b, &unknown)
+					result = append(result, unknown)
 			}
 		}
 		return result
@@ -681,6 +768,9 @@ func convertResponsesContentToChat(raw json.RawMessage) interface{} {
 func convertResponseFormatToText(rf json.RawMessage) map[string]interface{} {
 	var rfObj ResponseFormatObj
 	if err := json.Unmarshal(rf, &rfObj); err != nil {
+		return nil
+	}
+	if rfObj.Type == "" {
 		return nil
 	}
 
@@ -728,6 +818,11 @@ func convertResponseFormatToText(rf json.RawMessage) map[string]interface{} {
 func convertTextToResponseFormat(text json.RawMessage) interface{} {
 	var tf ResponsesTextFormat
 	if err := json.Unmarshal(text, &tf); err != nil {
+		return nil
+	}
+
+	// If no format specified (e.g., only verbosity), skip response_format
+	if tf.Format.Type == "" {
 		return nil
 	}
 
@@ -781,6 +876,9 @@ func convertID(id, prefix string) string {
 	return prefix + id
 }
 
+var idCounter uint64
+
 func generateID(prefix string) string {
-	return fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
+	count := atomic.AddUint64(&idCounter, 1)
+	return fmt.Sprintf("%s%d_%d", prefix, time.Now().UnixNano(), count)
 }

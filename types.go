@@ -244,6 +244,7 @@ type OutputTokensDetails struct {
 type ResponsesContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
+	Refusal  string `json:"refusal,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
 	Detail   string `json:"detail,omitempty"`
 	FileID   string `json:"file_id,omitempty"`
