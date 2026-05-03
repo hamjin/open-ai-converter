@@ -4,7 +4,7 @@ services:
     container_name: openai-converter
     restart: unless-stopped
     ports:
-      - "${PORT:-9090}:${PORT:-9090}"
+      - "127.0.0.1:${PORT:-9090}:${PORT:-9090}"
     environment:
       # 方向1: 客户端发 Chat Completions 请求 → 代理转换为 Responses API 调用上游
       - RESPONSES_API_BASE_URL=${RESPONSES_API_BASE_URL:-https://api.openai.com}
