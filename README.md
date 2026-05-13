@@ -23,6 +23,7 @@
 - **Vision（多模态图片）**：`image_url` ↔ `input_image` 自动映射
 - **Structured Output**：`response_format` ↔ `text.format` 完整映射（含 JSON Schema）
 - **Reasoning（推理控制）**：`reasoning_effort` ↔ `reasoning.effort` 双向转换
+- **Reasoning Output**：Responses API 的 `reasoning` 输出类型自动映射到 `reasoning_content` 字段
 - **Tool Calling（函数调用）**：完整的工具调用及流式 tool_calls 转换
 - **Refusal（拒绝回复）**：流式和非流式 refusal 内容透传
 - **详细 Usage**：`reasoning_tokens`、`cached_tokens` 明细映射
@@ -542,6 +543,7 @@ curl http://localhost:9090/v1/responses \
 | `choices[0].message.content` | `output[0].content[0].text` | 文本内容映射 |
 | `choices[0].message.tool_calls` | `output[].type=function_call` | 工具调用映射 |
 | `choices[0].message.refusal` | `output[0].content[0].type=refusal` | 拒绝内容映射 |
+| `choices[0].message.reasoning_content` | `output[].type=reasoning.summary` | 推理内容映射 |
 | `choices[0].finish_reason=stop` | `status=completed` | 完成状态 |
 | `choices[0].finish_reason=length` | `status=incomplete` | 截断状态 |
 | `choices[0].finish_reason=tool_calls` | 含 `function_call` 输出 | 工具调用状态 |
@@ -559,6 +561,7 @@ curl http://localhost:9090/v1/responses \
 |---|---|
 | `response.output_text.delta` | `delta.content` |
 | `response.refusal.delta` | `delta.refusal` |
+| `response.reasoning_summary_text.delta` | `delta.reasoning_content` |
 | `response.function_call_arguments.delta` | `delta.tool_calls[].function.arguments` |
 | `response.output_item.added` (function_call) | tool_call 初始化（id, name） |
 | `response.completed` | `finish_reason` + `usage` + `[DONE]` |
@@ -581,9 +584,11 @@ curl http://localhost:9090/v1/responses \
 ```
 system / developer  →  instructions 字段
 user                →  { role: "user", content: ... }
-assistant           →  { role: "assistant", content: ... }
+assistant           →  { role: "assistant", content: [{type: "output_text", ...}] }
 assistant (w/ tool_calls)  →  content (if any) + function_call items
+assistant (w/ thinking)    →  content wrapped in <thinking>...</thinking> tags
 tool                →  { type: "function_call_output", call_id: ..., output: ... }
+function (legacy)   →  { type: "function_call_output", call_id: name, output: ... }
 ```
 
 ### Responses API → Chat Completions
@@ -594,6 +599,8 @@ instructions        →  { role: "system", content: ... }
 { role: "assistant" } →  { role: "assistant", content: ... }
 { type: "function_call" }  →  { role: "assistant", tool_calls: [...] }
 { type: "function_call_output" }  →  { role: "tool", tool_call_id: ..., content: ... }
+{ type: "reasoning" }  →  reasoning_content 字段
+{ type: "web_search_call" }  →  静默消费（结果已融入文本输出）
 ```
 
 ## 不支持的功能
@@ -610,7 +617,8 @@ instructions        →  { role: "system", content: ... }
 | `previous_response_id` | Chat Completions 无会话链概念 |
 | `truncation` | Chat Completions 无自动截断策略 |
 | `logprobs` 详细值 | 两个 API 的 logprobs 结构不同，仅映射数量 |
-| `reasoning.summary` | Chat Completions 无 reasoning summary 支持 |
+| `reasoning.summary` | 流式推理摘要支持 `reasoning_content` 映射，非流式 `reasoning` 输出类型已支持 |
+| `reasoning.encrypted_content` | 自动请求包含，确保响应转换器有完整上下文 |
 | `modalities` (audio) | 两个 API 的音频处理方式不同 |
 | `prediction` | Chat Completions 独有功能 |
 
@@ -623,8 +631,9 @@ OPENAI_CONVERTER/
 ├── .gitlab-ci.yml    # GitLab CI/CD（多平台构建 & 容器发布）
 ├── go.mod            # Go 模块定义（零外部依赖）
 ├── main.go           # 入口、路由、中间件（CORS/日志）、.env 加载
-├── types.go          # 全部类型定义（Chat Completions & Responses API）
-├── convert.go        # 核心双向转换逻辑（请求/响应/Vision/Schema/Reasoning）
+├── types.go          # 全部类型定义（Chat Completions & Responses API & 流式事件）
+├── convert.go        # 核心双向转换逻辑（请求/响应/Vision/Schema/Reasoning/流式状态机）
+├── convert_test.go   # 单元测试（32 个测试用例）
 ├── handler.go        # HTTP 处理器 & 流式 SSE 转换
 ├── Dockerfile        # 多阶段构建（golang:1.23-alpine → alpine:3.19）
 ├── docker-compose.yml # Docker Compose 编排
@@ -633,12 +642,13 @@ OPENAI_CONVERTER/
 
 ### 源码说明
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `main.go` | ~170 | HTTP 服务器启动、路由注册、CORS/日志中间件、`.env` 加载 |
-| `types.go` | ~350 | 两个 API 的完整类型定义、流式事件类型、辅助函数 |
-| `convert.go` | ~780 | 请求/响应双向转换、Vision 图片转换、Structured Output 映射、Reasoning 映射 |
-| `handler.go` | ~780 | HTTP handler、非流式处理、双向流式 SSE 事件转换、上游请求 |
+| 文件 | 职责 |
+|---|---|
+| `main.go` | HTTP 服务器启动、路由注册、CORS/日志中间件、`.env` 加载 |
+| `types.go` | 两个 API 的完整类型定义、流式事件类型（`ResponsesStreamEvent`、`ChatCompletionsChunk`）、推理/工具辅助类型 |
+| `convert.go` | 请求/响应双向转换（强类型结构体）、流式状态机（`ResponsesEventToChatState`）、Vision/Schema/Reasoning 映射 |
+| `convert_test.go` | 32 个单元测试覆盖双向转换、流式状态机、边界情况 |
+| `handler.go` | HTTP handler、非流式处理、流式 SSE 事件转换（使用状态机）、上游请求转发 |
 
 ## API Key 处理
 
@@ -670,6 +680,17 @@ OPENAI_CONVERTER/
 ```
 
 ## Changelog
+
+### v1.2.0
+
+- **refactor**: 核心转换逻辑从 `map[string]interface{}` 重构为强类型结构体，提升编译期安全性
+- **feat**: Responses API `reasoning` 输出类型支持，自动映射到 `reasoning_content`
+- **feat**: `web_search_call` 输出类型静默消费（结果已融入文本输出）
+- **feat**: 流式状态机（`ResponsesEventToChatState`）替代 handler 内联 SSE 解析
+- **feat**: `max_output_tokens` 最小值钳位（128），防止上游 API 错误
+- **feat**: assistant thinking/reasoning 内容自动包裹 `<thinking>` 标签
+- **feat**: 空 base64 图片 data URI 自动过滤
+- **fix**: `incomplete_details` 使用结构化类型而非 `json.RawMessage`
 
 ### v1.1.0
 

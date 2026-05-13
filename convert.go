@@ -11,220 +11,305 @@ import (
 
 // ==================== Chat Completions → Responses API ====================
 
-func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, error) {
-	respReq := make(map[string]interface{})
-	respReq["model"] = chatReq.Model
-	respReq["stream"] = chatReq.Stream
-
-	// Convert messages → input
-	var inputMessages []map[string]interface{}
-	var instructionsParts []string
-
-	for _, msg := range chatReq.Messages {
-		switch msg.Role {
-		case "system", "developer":
-			text := contentToString(msg.Content)
-			if text != "" {
-				instructionsParts = append(instructionsParts, text)
-			}
-
-		case "user":
-			m := map[string]interface{}{
-				"role": "user",
-			}
-			if msg.Content != nil {
-				m["content"] = convertChatContentToResponses(msg.Content)
-			}
-			inputMessages = append(inputMessages, m)
-
-		case "assistant":
-			if msg.ToolCalls != nil {
-				text := contentToString(msg.Content)
-				if text != "" {
-					// Assistant message with text content → Responses API "message" item
-					inputMessages = append(inputMessages, map[string]interface{}{
-						"type":   "message",
-						"id":     generateID("msg_"),
-						"role":   "assistant",
-						"status": "completed",
-						"content": []map[string]interface{}{
-							{"type": "output_text", "text": text, "annotations": []interface{}{}},
-						},
-					})
-				}
-				for _, tc := range msg.ToolCalls {
-					inputMessages = append(inputMessages, map[string]interface{}{
-						"type":      "function_call",
-						"id":        tc.ID,
-						"call_id":   tc.ID,
-						"name":      tc.Function.Name,
-						"arguments": tc.Function.Arguments,
-						"status":    "completed",
-					})
-				}
-			} else {
-				// Assistant message without tool_calls → Responses API "message" item
-				text := contentToString(msg.Content)
-				m := map[string]interface{}{
-					"type":   "message",
-					"id":     generateID("msg_"),
-					"role":   "assistant",
-					"status": "completed",
-					"content": []map[string]interface{}{
-						{"type": "output_text", "text": text, "annotations": []interface{}{}},
-					},
-				}
-				inputMessages = append(inputMessages, m)
-			}
-
-		case "tool":
-			inputMessages = append(inputMessages, map[string]interface{}{
-				"type":    "function_call_output",
-				"call_id": msg.ToolCallID,
-				"output":  contentToString(msg.Content),
-			})
-		}
+func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesRequest, error) {
+	input, instructions, err := convertChatMessagesToResponsesInput(chatReq.Messages)
+	if err != nil {
+		return nil, err
 	}
 
-	respReq["input"] = inputMessages
-
-	if len(instructionsParts) > 0 {
-		respReq["instructions"] = strings.Join(instructionsParts, "\n\n")
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
 	}
 
-	// ---- Parameter mapping ----
+	out := &ResponsesRequest{
+		Model:        chatReq.Model,
+		Input:        inputJSON,
+		Temperature:  chatReq.Temperature,
+		TopP:         chatReq.TopP,
+		Stream:       chatReq.Stream,
+		ServiceTier:  chatReq.ServiceTier,
+	}
 
-	// max_tokens / max_completion_tokens → max_output_tokens
+	if instructions != "" {
+		out.Instructions = &instructions
+	}
+
+	// Set defaults for upstream streaming
+	if chatReq.Stream {
+		out.Include = []string{"reasoning.encrypted_content"}
+		storeFalse := false
+		out.Store = &storeFalse
+	}
+
+	// Extract instructions from system/developer messages
+	// (already handled inside convertChatMessagesToResponsesInput)
+
 	if chatReq.MaxCompletionTokens != nil {
-		respReq["max_output_tokens"] = *chatReq.MaxCompletionTokens
+		v := *chatReq.MaxCompletionTokens
+		if v < minMaxOutputTokens {
+			v = minMaxOutputTokens
+		}
+		out.MaxOutputTokens = &v
 	} else if chatReq.MaxTokens != nil {
-		respReq["max_output_tokens"] = *chatReq.MaxTokens
+		v := *chatReq.MaxTokens
+		if v < minMaxOutputTokens {
+			v = minMaxOutputTokens
+		}
+		out.MaxOutputTokens = &v
 	}
 
-	if chatReq.Temperature != nil {
-		respReq["temperature"] = *chatReq.Temperature
-	}
-
-	// n parameter: Responses API only supports single output
 	if chatReq.N != nil && *chatReq.N > 1 {
 		log.Printf("[chat->resp] WARNING: n=%d requested but Responses API only supports 1 output", *chatReq.N)
 	}
 
-	if chatReq.TopP != nil {
-		respReq["top_p"] = *chatReq.TopP
-	}
 	if chatReq.FrequencyPenalty != nil {
-		respReq["frequency_penalty"] = *chatReq.FrequencyPenalty
+		out.FrequencyPenalty = chatReq.FrequencyPenalty
 	}
 	if chatReq.PresencePenalty != nil {
-		respReq["presence_penalty"] = *chatReq.PresencePenalty
+		out.PresencePenalty = chatReq.PresencePenalty
 	}
-
-	// stop → (no direct equivalent, but some implementations accept it)
 	if chatReq.Stop != nil {
-		respReq["stop"] = json.RawMessage(chatReq.Stop)
+		out.Stop = chatReq.Stop
 	}
-
-	// seed → (pass through, some implementations support it)
 	if chatReq.Seed != nil {
-		respReq["seed"] = *chatReq.Seed
+		out.Seed = chatReq.Seed
 	}
-
-	// store
 	if chatReq.Store != nil {
-		respReq["store"] = *chatReq.Store
+		out.Store = chatReq.Store
 	}
-
-	// metadata
 	if chatReq.Metadata != nil {
-		var md interface{}
-		json.Unmarshal(chatReq.Metadata, &md)
-		respReq["metadata"] = md
+		out.Metadata = chatReq.Metadata
 	}
-
-	// service_tier
-	if chatReq.ServiceTier != nil {
-		respReq["service_tier"] = *chatReq.ServiceTier
-	}
-
-	// logprobs → top_logprobs
 	if chatReq.TopLogprobs != nil {
-		respReq["top_logprobs"] = *chatReq.TopLogprobs
+		out.TopLogprobs = chatReq.TopLogprobs
 	} else if chatReq.Logprobs != nil && *chatReq.Logprobs {
-		respReq["top_logprobs"] = 1
+		v := 1
+		out.TopLogprobs = &v
+	}
+	if chatReq.ParallelToolCalls != nil {
+		out.ParallelToolCalls = chatReq.ParallelToolCalls
+	}
+	if chatReq.User != nil {
+		out.User = chatReq.User
 	}
 
-	// reasoning_effort → reasoning.effort
+	// reasoning_effort → reasoning.effort + summary="auto"
 	if chatReq.ReasoningEffort != nil {
-		respReq["reasoning"] = map[string]interface{}{
-			"effort": *chatReq.ReasoningEffort,
+		out.Reasoning = &ResponsesReasoning{
+			Effort:  *chatReq.ReasoningEffort,
+			Summary: "auto",
 		}
 	}
 
 	// response_format → text.format
 	if chatReq.ResponseFormat != nil {
 		if text := convertResponseFormatToText(chatReq.ResponseFormat); text != nil {
-			respReq["text"] = text
+			out.Text = json.RawMessage(mustMarshal(text))
 		}
 	}
 
-	// parallel_tool_calls
-	if chatReq.ParallelToolCalls != nil {
-		respReq["parallel_tool_calls"] = *chatReq.ParallelToolCalls
-	}
-
-	// Convert tools
+	// tools
 	if len(chatReq.Tools) > 0 {
-		var respTools []map[string]interface{}
-		for _, t := range chatReq.Tools {
-			rt := map[string]interface{}{
-				"type": "function",
-				"name": t.Function.Name,
-			}
-			if t.Function.Description != "" {
-				rt["description"] = t.Function.Description
-			}
-			if t.Function.Parameters != nil {
-				var params interface{}
-				json.Unmarshal(t.Function.Parameters, &params)
-				rt["parameters"] = params
-			}
-			if t.Function.Strict != nil {
-				rt["strict"] = *t.Function.Strict
-			}
-			respTools = append(respTools, rt)
-		}
-		respReq["tools"] = respTools
+		out.Tools = json.RawMessage(mustMarshal(convertChatToolsToResponses(chatReq.Tools)))
 	}
 
+	// tool_choice
 	if chatReq.ToolChoice != nil {
-		var tc interface{}
-		json.Unmarshal(chatReq.ToolChoice, &tc)
-		respReq["tool_choice"] = tc
+		out.ToolChoice = chatReq.ToolChoice
 	}
 
-	if chatReq.User != nil {
-		respReq["user"] = *chatReq.User
-	}
-
-	// stream_options: pass through for streaming requests
+	// stream_options
 	if chatReq.Stream {
 		if chatReq.StreamOptions != nil {
-			respReq["stream_options"] = map[string]interface{}{
-				"include_usage": chatReq.StreamOptions.IncludeUsage,
-			}
+			out.StreamOptions = &StreamOptions{IncludeUsage: chatReq.StreamOptions.IncludeUsage}
 		} else {
-			// Auto-enable usage for streaming to ensure final chunk has usage data
-			respReq["stream_options"] = map[string]interface{}{
-				"include_usage": true,
+			out.StreamOptions = &StreamOptions{IncludeUsage: true}
+		}
+	}
+
+	return out, nil
+}
+
+// convertChatMessagesToResponsesInput converts messages to Responses input items.
+// System/developer messages are collected into instructions.
+func convertChatMessagesToResponsesInput(msgs []ChatMessage) ([]ResponsesInputMessage, string, error) {
+	var out []ResponsesInputMessage
+	var instructionsParts []string
+
+	for _, m := range msgs {
+		switch m.Role {
+		case "system", "developer":
+			text := contentToString(m.Content)
+			if text != "" {
+				instructionsParts = append(instructionsParts, text)
+			}
+		default:
+			items, err := chatMessageToResponsesItems(m)
+			if err != nil {
+				return nil, "", err
+			}
+			out = append(out, items...)
+		}
+	}
+
+	instructions := strings.Join(instructionsParts, "\n\n")
+	return out, instructions, nil
+}
+
+func chatMessageToResponsesItems(m ChatMessage) ([]ResponsesInputMessage, error) {
+	switch m.Role {
+	case "user":
+		return chatUserToResponses(m)
+	case "assistant":
+		return chatAssistantToResponses(m)
+	case "tool":
+		return chatToolToResponses(m)
+	case "function":
+		return chatFunctionToResponses(m)
+	default:
+		return chatUserToResponses(m)
+	}
+}
+
+func chatUserToResponses(m ChatMessage) ([]ResponsesInputMessage, error) {
+	if m.Content != nil {
+		return []ResponsesInputMessage{{
+			Role:    "user",
+			Content: json.RawMessage(mustMarshal(convertChatContentToResponses(m.Content))),
+		}}, nil
+	}
+	return []ResponsesInputMessage{{Role: "user"}}, nil
+}
+
+func chatAssistantToResponses(m ChatMessage) ([]ResponsesInputMessage, error) {
+	var items []ResponsesInputMessage
+
+	if len(m.Content) > 0 {
+		s := parseAssistantContent(m.Content)
+		if s != "" {
+			parts := []map[string]interface{}{
+				{"type": "output_text", "text": s, "annotations": []interface{}{}},
+			}
+			items = append(items, ResponsesInputMessage{
+				Role:    "assistant",
+				Content: json.RawMessage(mustMarshal(parts)),
+			})
+		}
+	}
+
+	for _, tc := range m.ToolCalls {
+		args := tc.Function.Arguments
+		if args == "" {
+			args = "{}"
+		}
+		items = append(items, ResponsesInputMessage{
+			Type:      "function_call",
+			ID:        tc.ID,
+			CallID:    tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: args,
+			Status:    "completed",
+		})
+	}
+
+	return items, nil
+}
+
+// parseAssistantContent returns assistant content as plain text.
+// For structured thinking/reasoning parts, wraps in <thinking>...</thinking> tags.
+func parseAssistantContent(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return contentToString(raw)
+	}
+
+	var b strings.Builder
+	for _, p := range parts {
+		typ, _ := p["type"].(string)
+		text, _ := p["text"].(string)
+		thinking, _ := p["thinking"].(string)
+
+		switch typ {
+		case "thinking", "reasoning":
+			content := thinking
+			if content == "" {
+				content = text
+			}
+			if content != "" {
+				b.WriteString("<thinking>")
+				b.WriteString(content)
+				b.WriteString("</thinking>")
+			}
+		default:
+			if text != "" {
+				b.WriteString(text)
 			}
 		}
 	}
 
-	return json.Marshal(respReq)
+	return b.String()
 }
 
-// ConvertResponsesRespToChatResp converts Responses API response → Chat Completions response
+func chatToolToResponses(m ChatMessage) ([]ResponsesInputMessage, error) {
+	output := contentToString(m.Content)
+	if output == "" {
+		output = "(empty)"
+	}
+	return []ResponsesInputMessage{{
+		Type:   "function_call_output",
+		CallID: m.ToolCallID,
+		Output: output,
+	}}, nil
+}
+
+func chatFunctionToResponses(m ChatMessage) ([]ResponsesInputMessage, error) {
+	output := contentToString(m.Content)
+	if output == "" {
+		output = "(empty)"
+	}
+	return []ResponsesInputMessage{{
+		Type:   "function_call_output",
+		CallID: m.Name,
+		Output: output,
+	}}, nil
+}
+
+func convertChatToolsToResponses(tools []ChatTool) []ResponsesTool {
+	var out []ResponsesTool
+	for _, t := range tools {
+		if t.Type != "function" {
+			continue
+		}
+		rt := ResponsesTool{
+			Type: "function",
+			Name: t.Function.Name,
+		}
+		if t.Function.Description != "" {
+			rt.Description = t.Function.Description
+		}
+		if t.Function.Parameters != nil {
+			rt.Parameters = t.Function.Parameters
+		}
+		if t.Function.Strict != nil {
+			rt.Strict = t.Function.Strict
+		}
+		out = append(out, rt)
+	}
+	return out
+}
+
+// ==================== Responses API → Chat Completions (Non-Streaming) ====================
+
 func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletionsResponse, error) {
 	chatResp := &ChatCompletionsResponse{
 		ID:          convertID(respResp.ID, "chatcmpl-"),
@@ -235,9 +320,9 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 	}
 
 	var textParts []string
+	var reasoningText string
 	var toolCalls []ToolCall
 	var refusal *string
-	finishReason := "stop"
 
 	for _, item := range respResp.Output {
 		switch item.Type {
@@ -254,7 +339,6 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 					refusal = &r
 				}
 			}
-
 		case "function_call":
 			toolCalls = append(toolCalls, ToolCall{
 				ID:   item.CallID,
@@ -264,14 +348,18 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 					Arguments: item.Arguments,
 				},
 			})
-			finishReason = "tool_calls"
+		case "reasoning":
+			for _, s := range item.Summary {
+				if s.Type == "summary_text" && s.Text != "" {
+					reasoningText += s.Text
+				}
+			}
+		case "web_search_call":
+			// silently consumed — results already incorporated into text output
 		}
 	}
 
-	// Check incomplete_details for length finish reason
-	if respResp.Status == "incomplete" {
-		finishReason = "length"
-	}
+	finishReason := responsesStatusToChatFinishReason(respResp.Status, respResp.IncompleteDetails, toolCalls)
 
 	msg := ChatMessage{
 		Role:    "assistant",
@@ -286,6 +374,9 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 	if len(toolCalls) > 0 {
 		msg.ToolCalls = toolCalls
 	}
+	if reasoningText != "" {
+		msg.ReasoningContent = reasoningText
+	}
 
 	chatResp.Choices = []ChatChoice{
 		{
@@ -295,7 +386,7 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 		},
 	}
 
-	// Convert usage with details
+	// Convert usage
 	if respResp.Usage != nil {
 		chatResp.Usage = &ChatUsage{
 			PromptTokens:     respResp.Usage.InputTokens,
@@ -317,20 +408,38 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 	return chatResp, nil
 }
 
-// ==================== Responses API → Chat Completions ====================
+func responsesStatusToChatFinishReason(status string, details *ResponsesIncompleteDetails, toolCalls []ToolCall) string {
+	switch status {
+	case "incomplete":
+		if details != nil && details.Reason == "max_output_tokens" {
+			return "length"
+		}
+		return "stop"
+	case "completed":
+		if len(toolCalls) > 0 {
+			return "tool_calls"
+		}
+		return "stop"
+	default:
+		return "stop"
+	}
+}
 
-func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
-	chatReq := make(map[string]interface{})
-	chatReq["model"] = respReq.Model
-	chatReq["stream"] = respReq.Stream
+// ==================== Responses API → Chat Completions (Request Conversion) ====================
 
-	var messages []map[string]interface{}
+func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsRequest, error) {
+	chatReq := &ChatCompletionsRequest{
+		Model:  respReq.Model,
+		Stream: respReq.Stream,
+	}
 
-	// Add instructions as system message
+	var messages []ChatMessage
+
+	// instructions → system message
 	if respReq.Instructions != nil && *respReq.Instructions != "" {
-		messages = append(messages, map[string]interface{}{
-			"role":    "system",
-			"content": *respReq.Instructions,
+		messages = append(messages, ChatMessage{
+			Role:    "system",
+			Content: jsonString(*respReq.Instructions),
 		})
 	}
 
@@ -338,228 +447,173 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 	if respReq.Input != nil {
 		var inputStr string
 		if err := json.Unmarshal(respReq.Input, &inputStr); err == nil {
-			messages = append(messages, map[string]interface{}{
-				"role":    "user",
-				"content": inputStr,
+			messages = append(messages, ChatMessage{
+				Role:    "user",
+				Content: jsonString(inputStr),
 			})
 		} else {
 			var inputMsgs []json.RawMessage
 			if err := json.Unmarshal(respReq.Input, &inputMsgs); err == nil {
-				// Process each input message with type awareness
 				for _, rawMsg := range inputMsgs {
 					var im ResponsesInputMessage
 					json.Unmarshal(rawMsg, &im)
 
 					switch {
 					case im.Type == "function_call_output":
-						messages = append(messages, map[string]interface{}{
-							"role":         "tool",
-							"content":      im.Output,
-							"tool_call_id": im.CallID,
+						messages = append(messages, ChatMessage{
+							Role:       "tool",
+							Content:    jsonString(im.Output),
+							ToolCallID: im.CallID,
 						})
-
 					case im.Type == "function_call":
-						m := map[string]interface{}{
-							"role": "assistant",
-							"tool_calls": []map[string]interface{}{
-								{
-									"id":   im.CallID,
-									"type": "function",
-									"function": map[string]interface{}{
-										"name":      im.Name,
-										"arguments": im.Arguments,
-									},
+						messages = append(messages, ChatMessage{
+							Role: "assistant",
+							ToolCalls: []ToolCall{{
+								ID:   im.CallID,
+								Type: "function",
+								Function: FunctionCall{
+									Name:      im.Name,
+									Arguments: im.Arguments,
 								},
-							},
-						}
-						messages = append(messages, m)
-
+							}},
+						})
 					default:
 						role := im.Role
 						if role == "" {
 							role = "assistant"
 						}
-						m := map[string]interface{}{
-							"role": role,
-						}
+						msg := ChatMessage{Role: role}
 						if im.Content != nil {
-							m["content"] = convertResponsesContentToChat(im.Content)
-							// Extract refusal from content parts
+							msg.Content = json.RawMessage(mustMarshal(convertResponsesContentToChat(im.Content)))
+							// Extract refusal
 							var parts []ResponsesContentPart
 							if err := json.Unmarshal(im.Content, &parts); err == nil {
 								for _, p := range parts {
 									if p.Type == "refusal" && p.Refusal != "" {
-										m["refusal"] = p.Refusal
+										msg.Refusal = &p.Refusal
 										break
 									}
 								}
 							}
 						}
-						messages = append(messages, m)
+						messages = append(messages, msg)
 					}
 				}
 			}
 		}
 	}
+	chatReq.Messages = messages
 
-	chatReq["messages"] = messages
-
-	// ---- Parameter mapping ----
-
-	// max_output_tokens → max_completion_tokens (prefer newer field)
+	// Parameter mapping
 	if respReq.MaxOutputTokens != nil {
-		chatReq["max_completion_tokens"] = *respReq.MaxOutputTokens
+		chatReq.MaxCompletionTokens = respReq.MaxOutputTokens
 	}
-	if respReq.Temperature != nil {
-		chatReq["temperature"] = *respReq.Temperature
-	}
-	if respReq.TopP != nil {
-		chatReq["top_p"] = *respReq.TopP
-	}
-	if respReq.FrequencyPenalty != nil {
-		chatReq["frequency_penalty"] = *respReq.FrequencyPenalty
-	}
-	if respReq.PresencePenalty != nil {
-		chatReq["presence_penalty"] = *respReq.PresencePenalty
-	}
-
-	// store
-	if respReq.Store != nil {
-		chatReq["store"] = *respReq.Store
-	}
-
-	// metadata
-	if respReq.Metadata != nil {
-		var md interface{}
-		json.Unmarshal(respReq.Metadata, &md)
-		chatReq["metadata"] = md
-	}
-
-	// service_tier
-	if respReq.ServiceTier != nil {
-		chatReq["service_tier"] = *respReq.ServiceTier
-	}
+	chatReq.Temperature = respReq.Temperature
+	chatReq.TopP = respReq.TopP
+	chatReq.FrequencyPenalty = respReq.FrequencyPenalty
+	chatReq.PresencePenalty = respReq.PresencePenalty
+	chatReq.Store = respReq.Store
+	chatReq.Metadata = respReq.Metadata
+	chatReq.ServiceTier = respReq.ServiceTier
+	chatReq.ParallelToolCalls = respReq.ParallelToolCalls
+	chatReq.User = respReq.User
+	chatReq.ToolChoice = respReq.ToolChoice
 
 	// top_logprobs → logprobs + top_logprobs
 	if respReq.TopLogprobs != nil && *respReq.TopLogprobs > 0 {
-		chatReq["logprobs"] = true
-		chatReq["top_logprobs"] = *respReq.TopLogprobs
+		logprobs := true
+		chatReq.Logprobs = &logprobs
+		chatReq.TopLogprobs = respReq.TopLogprobs
 	}
 
 	// reasoning.effort → reasoning_effort
-	if respReq.Reasoning != nil {
-		var rc ReasoningConfig
-		if err := json.Unmarshal(respReq.Reasoning, &rc); err == nil && rc.Effort != "" {
-			chatReq["reasoning_effort"] = rc.Effort
-		}
+	if respReq.Reasoning != nil && respReq.Reasoning.Effort != "" {
+		chatReq.ReasoningEffort = &respReq.Reasoning.Effort
 	}
 
 	// text.format → response_format
 	if respReq.Text != nil {
 		if rf := convertTextToResponseFormat(respReq.Text); rf != nil {
-			chatReq["response_format"] = rf
+			chatReq.ResponseFormat = json.RawMessage(mustMarshal(rf))
 		}
 	}
 
-	// parallel_tool_calls
-	if respReq.ParallelToolCalls != nil {
-		chatReq["parallel_tool_calls"] = *respReq.ParallelToolCalls
-	}
-
-	// Convert tools (handle function + skip unsupported types with warning)
+	// Convert tools
 	if respReq.Tools != nil {
 		var respTools []map[string]interface{}
 		if err := json.Unmarshal(respReq.Tools, &respTools); err == nil {
-			var chatTools []map[string]interface{}
+			var chatTools []ChatTool
 			for _, rt := range respTools {
 				toolType, _ := rt["type"].(string)
 				switch toolType {
 				case "function":
-					ct := map[string]interface{}{
-						"type": "function",
-						"function": map[string]interface{}{
-							"name": rt["name"],
-						},
+					fn := ChatFunction{}
+					if name, ok := rt["name"].(string); ok {
+						fn.Name = name
 					}
-					fn := ct["function"].(map[string]interface{})
-					if desc, ok := rt["description"]; ok {
-						fn["description"] = desc
+					if desc, ok := rt["description"].(string); ok {
+						fn.Description = desc
 					}
 					if params, ok := rt["parameters"]; ok {
-						// Extract strict from parameters if present (robustness)
 						if paramsMap, ok := params.(map[string]interface{}); ok {
-							if s, ok := paramsMap["strict"]; ok {
-								fn["strict"] = s
+							if s, hasStrict := paramsMap["strict"]; hasStrict {
+								boolVal, ok := s.(bool)
+								if ok {
+									fn.Strict = &boolVal
+								}
 								delete(paramsMap, "strict")
 							}
 						}
-						fn["parameters"] = params
+						fn.Parameters = json.RawMessage(mustMarshal(params))
 					}
-					if strict, ok := rt["strict"]; ok {
-						fn["strict"] = strict
+					if strict, ok := rt["strict"].(bool); ok {
+						fn.Strict = &strict
 					}
-					chatTools = append(chatTools, ct)
-					case "namespace":
-						// Flatten namespace tools (e.g., MCP) with prefixed names
-						nsName, _ := rt["name"].(string)
-						var nsTools []map[string]interface{}
-						if raw, ok := rt["tools"]; ok {
-							b, _ := json.Marshal(raw)
-							json.Unmarshal(b, &nsTools)
+					chatTools = append(chatTools, ChatTool{Type: "function", Function: fn})
+				case "namespace":
+					nsName, _ := rt["name"].(string)
+					var nsTools []map[string]interface{}
+					if raw, ok := rt["tools"]; ok {
+						b, _ := json.Marshal(raw)
+						json.Unmarshal(b, &nsTools)
+					}
+					for _, nt := range nsTools {
+						ntType, _ := nt["type"].(string)
+						if ntType != "function" {
+							continue
 						}
-						for _, nt := range nsTools {
-							ntType, _ := nt["type"].(string)
-							if ntType != "function" {
-								continue
-							}
-							ct := map[string]interface{}{
-								"type": "function",
-								"function": map[string]interface{}{
-									"name": nsName + nt["name"].(string),
-								},
-							}
-							fn := ct["function"].(map[string]interface{})
-							if desc, ok := nt["description"]; ok {
-								fn["description"] = desc
-							}
-							if params, ok := nt["parameters"]; ok {
-								fn["parameters"] = params
-							}
-							if strict, ok := nt["strict"]; ok {
-								fn["strict"] = strict
-							}
-							chatTools = append(chatTools, ct)
+						fn := ChatFunction{}
+						if name, ok := nt["name"].(string); ok {
+							fn.Name = nsName + name
 						}
-					// web_search, file_search, code_interpreter, computer_use
-					// cannot be mapped to Chat Completions — silently skip
+						if desc, ok := nt["description"].(string); ok {
+							fn.Description = desc
+						}
+						if params, ok := nt["parameters"]; ok {
+							fn.Parameters = json.RawMessage(mustMarshal(params))
+						}
+						if strict, ok := nt["strict"].(bool); ok {
+							fn.Strict = &strict
+						}
+						chatTools = append(chatTools, ChatTool{Type: "function", Function: fn})
+					}
 				}
 			}
 			if len(chatTools) > 0 {
-				chatReq["tools"] = chatTools
+				chatReq.Tools = chatTools
 			}
 		}
 	}
 
-	if respReq.ToolChoice != nil {
-		var tc interface{}
-		json.Unmarshal(respReq.ToolChoice, &tc)
-		chatReq["tool_choice"] = tc
-	}
-
-	if respReq.User != nil {
-		chatReq["user"] = *respReq.User
-	}
-
 	if respReq.Stream {
-		chatReq["stream_options"] = map[string]interface{}{
-			"include_usage": true,
-		}
+		chatReq.StreamOptions = &StreamOptions{IncludeUsage: true}
 	}
 
-	return json.Marshal(chatReq)
+	return chatReq, nil
 }
 
-// ConvertChatRespToResponsesResp converts Chat Completions response → Responses API response
+// ==================== Chat Completions Response → Responses API Response ====================
+
 func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*ResponsesResponse, error) {
 	respResp := &ResponsesResponse{
 		ID:          convertID(chatResp.ID, "resp_"),
@@ -576,13 +630,11 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 		}
 		msg := choice.Message
 
-		// Check finish reason for incomplete
 		if choice.FinishReason != nil && *choice.FinishReason == "length" {
 			respResp.Status = "incomplete"
-			respResp.IncompleteDetails = json.RawMessage(`{"reason":"max_output_tokens"}`)
+			respResp.IncompleteDetails = &ResponsesIncompleteDetails{Reason: "max_output_tokens"}
 		}
 
-		// Add message output item
 		text := contentToString(msg.Content)
 		hasText := text != ""
 		if hasText || len(msg.ToolCalls) == 0 {
@@ -594,40 +646,34 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 			}
 
 			if msg.Refusal != nil && *msg.Refusal != "" {
-				outputItem.Content = []ContentPart{
-					{
-						Type:    "refusal",
-						Refusal: *msg.Refusal,
-					},
-				}
+				outputItem.Content = []ContentPart{{
+					Type:    "refusal",
+					Refusal: *msg.Refusal,
+				}}
 			} else {
-				outputItem.Content = []ContentPart{
-					{
-						Type:        "output_text",
-						Text:        text,
-						Annotations: json.RawMessage("[]"),
-					},
-				}
+				outputItem.Content = []ContentPart{{
+					Type:        "output_text",
+					Text:        text,
+					Annotations: json.RawMessage("[]"),
+				}}
 			}
 
 			respResp.Output = append(respResp.Output, outputItem)
 		}
 
-		// Add function_call output items for tool calls
 		for _, tc := range msg.ToolCalls {
-			outputItem := OutputItem{
+			respResp.Output = append(respResp.Output, OutputItem{
 				ID:        tc.ID,
 				Type:      "function_call",
 				Status:    "completed",
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
 				CallID:    tc.ID,
-			}
-			respResp.Output = append(respResp.Output, outputItem)
+			})
 		}
 	}
 
-	// Convert usage with details
+	// Convert usage
 	if chatResp.Usage != nil {
 		respResp.Usage = &ResponsesUsage{
 			InputTokens:  chatResp.Usage.PromptTokens,
@@ -649,22 +695,240 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 	return respResp, nil
 }
 
+// ==================== Streaming State Machine ====================
+
+// ResponsesEventToChatState tracks state for converting Responses SSE events to Chat chunks.
+type ResponsesEventToChatState struct {
+	ID      string
+	Model   string
+	Created int64
+
+	SentRole    bool
+	SawToolCall bool
+	SawText     bool
+	Finalized   bool
+
+	NextToolCallIndex      int
+	OutputIndexToToolIndex map[int]int
+
+	IncludeUsage bool
+	Usage        *ChatUsage
+}
+
+func NewResponsesEventToChatState() *ResponsesEventToChatState {
+	return &ResponsesEventToChatState{
+		ID:                     generateID("chatcmpl-"),
+		Created:                nowUnix(),
+		OutputIndexToToolIndex: make(map[int]int),
+		IncludeUsage:           true,
+	}
+}
+
+// ResponsesEventToChatChunks converts a single Responses SSE event into Chat chunks.
+func ResponsesEventToChatChunks(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	switch evt.Type {
+	case "response.created":
+		return resToChatHandleCreated(evt, state)
+	case "response.output_text.delta":
+		return resToChatHandleTextDelta(evt, state)
+	case "response.output_item.added":
+		return resToChatHandleOutputItemAdded(evt, state)
+	case "response.function_call_arguments.delta":
+		return resToChatHandleFuncArgsDelta(evt, state)
+	case "response.reasoning_summary_text.delta":
+		return resToChatHandleReasoningDelta(evt, state)
+	case "response.reasoning_summary_text.done":
+		return nil
+	case "response.completed", "response.done", "response.incomplete", "response.failed":
+		return resToChatHandleCompleted(evt, state)
+	default:
+		return nil
+	}
+}
+
+// FinalizeResponsesChatStream emits a final chunk if stream ended without completion event.
+func FinalizeResponsesChatStream(state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if state.Finalized {
+		return nil
+	}
+	state.Finalized = true
+
+	finishReason := "stop"
+	if state.SawToolCall {
+		finishReason = "tool_calls"
+	}
+
+	chunks := []ChatCompletionsChunk{makeChatFinishChunk(state, finishReason)}
+
+	if state.IncludeUsage && state.Usage != nil {
+		chunks = append(chunks, ChatCompletionsChunk{
+			ID: state.ID, Object: "chat.completion.chunk",
+			Created: state.Created, Model: state.Model,
+			Choices: []ChatChunkChoice{},
+			Usage:   state.Usage,
+		})
+	}
+
+	return chunks
+}
+
+func resToChatHandleCreated(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Response != nil {
+		if evt.Response.ID != "" {
+			state.ID = evt.Response.ID
+		}
+		if state.Model == "" && evt.Response.Model != "" {
+			state.Model = evt.Response.Model
+		}
+	}
+	if state.SentRole {
+		return nil
+	}
+	state.SentRole = true
+	role := "assistant"
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{Role: role})}
+}
+
+func resToChatHandleTextDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Delta == "" {
+		return nil
+	}
+	state.SawText = true
+	content := evt.Delta
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{Content: &content})}
+}
+
+func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Item == nil || evt.Item.Type != "function_call" {
+		return nil
+	}
+	state.SawToolCall = true
+	idx := state.NextToolCallIndex
+	state.OutputIndexToToolIndex[evt.OutputIndex] = idx
+	state.NextToolCallIndex++
+
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
+		ToolCalls: []ToolCall{{
+			Index: &idx,
+			ID:    evt.Item.CallID,
+			Type:  "function",
+			Function: FunctionCall{Name: evt.Item.Name},
+		}},
+	})}
+}
+
+func resToChatHandleFuncArgsDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Delta == "" {
+		return nil
+	}
+	idx, ok := state.OutputIndexToToolIndex[evt.OutputIndex]
+	if !ok {
+		return nil
+	}
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
+		ToolCalls: []ToolCall{{
+			Index: &idx,
+			Function: FunctionCall{Arguments: evt.Delta},
+		}},
+	})}
+}
+
+func resToChatHandleReasoningDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Delta == "" {
+		return nil
+	}
+	reasoning := evt.Delta
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{ReasoningContent: &reasoning})}
+}
+
+func resToChatHandleCompleted(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	state.Finalized = true
+	finishReason := "stop"
+
+	if evt.Response != nil {
+		if evt.Response.Usage != nil {
+			u := evt.Response.Usage
+			usage := &ChatUsage{
+				PromptTokens:     u.InputTokens,
+				CompletionTokens: u.OutputTokens,
+				TotalTokens:      u.InputTokens + u.OutputTokens,
+			}
+			if u.InputTokensDetails != nil && u.InputTokensDetails.CachedTokens > 0 {
+				usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: u.InputTokensDetails.CachedTokens}
+			}
+			state.Usage = usage
+		}
+		switch evt.Response.Status {
+		case "incomplete":
+			if evt.Response.IncompleteDetails != nil && evt.Response.IncompleteDetails.Reason == "max_output_tokens" {
+				finishReason = "length"
+			}
+		case "completed":
+			if state.SawToolCall {
+				finishReason = "tool_calls"
+			}
+		}
+	} else if state.SawToolCall {
+		finishReason = "tool_calls"
+	}
+
+	var chunks []ChatCompletionsChunk
+	chunks = append(chunks, makeChatFinishChunk(state, finishReason))
+
+	if state.IncludeUsage && state.Usage != nil {
+		chunks = append(chunks, ChatCompletionsChunk{
+			ID: state.ID, Object: "chat.completion.chunk",
+			Created: state.Created, Model: state.Model,
+			Choices: []ChatChunkChoice{},
+			Usage:   state.Usage,
+		})
+	}
+
+	return chunks
+}
+
+func makeChatDeltaChunk(state *ResponsesEventToChatState, delta ChatDelta) ChatCompletionsChunk {
+	return ChatCompletionsChunk{
+		ID: state.ID, Object: "chat.completion.chunk",
+		Created: state.Created, Model: state.Model,
+		Choices: []ChatChunkChoice{{Index: 0, Delta: delta}},
+	}
+}
+
+func makeChatFinishChunk(state *ResponsesEventToChatState, finishReason string) ChatCompletionsChunk {
+	empty := ""
+	return ChatCompletionsChunk{
+		ID: state.ID, Object: "chat.completion.chunk",
+		Created: state.Created, Model: state.Model,
+		Choices: []ChatChunkChoice{{
+			Index: 0,
+			Delta: ChatDelta{Content: &empty},
+			FinishReason: &finishReason,
+		}},
+	}
+}
+
+// ChatChunkToSSE formats a chunk as SSE data line.
+func ChatChunkToSSE(chunk ChatCompletionsChunk) (string, error) {
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("data: %s\n\n", data), nil
+}
+
 // ==================== Vision Content Conversion ====================
 
-// convertChatContentToResponses converts Chat Completions content (string or multipart array)
-// to Responses API input format, handling image_url → input_image conversion
 func convertChatContentToResponses(raw json.RawMessage) interface{} {
 	if raw == nil {
 		return nil
 	}
 
-	// Try as string
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
 
-	// Try as multipart array
 	var parts []ChatContentPart
 	if err := json.Unmarshal(raw, &parts); err == nil {
 		var result []map[string]interface{}
@@ -676,7 +940,7 @@ func convertChatContentToResponses(raw json.RawMessage) interface{} {
 					"text": p.Text,
 				})
 			case "image_url":
-				if p.ImageURL != nil {
+				if p.ImageURL != nil && p.ImageURL.URL != "" && !isEmptyBase64DataURI(p.ImageURL.URL) {
 					img := map[string]interface{}{
 						"type":      "input_image",
 						"image_url": p.ImageURL.URL,
@@ -687,7 +951,6 @@ func convertChatContentToResponses(raw json.RawMessage) interface{} {
 					result = append(result, img)
 				}
 			default:
-				// Pass through unknown types
 				var raw map[string]interface{}
 				b, _ := json.Marshal(p)
 				json.Unmarshal(b, &raw)
@@ -697,26 +960,21 @@ func convertChatContentToResponses(raw json.RawMessage) interface{} {
 		return result
 	}
 
-	// Fallback
 	var raw2 interface{}
 	json.Unmarshal(raw, &raw2)
 	return raw2
 }
 
-// convertResponsesContentToChat converts Responses API content (string or multipart array)
-// to Chat Completions format, handling input_image → image_url conversion
 func convertResponsesContentToChat(raw json.RawMessage) interface{} {
 	if raw == nil {
 		return nil
 	}
 
-	// Try as string
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
 
-	// Try as multipart array
 	var parts []ResponsesContentPart
 	if err := json.Unmarshal(raw, &parts); err == nil {
 		var result []map[string]interface{}
@@ -738,20 +996,20 @@ func convertResponsesContentToChat(raw json.RawMessage) interface{} {
 					img["image_url"].(map[string]interface{})["detail"] = p.Detail
 				}
 				result = append(result, img)
-				case "refusal":
-					refusalText := p.Refusal
-					if refusalText == "" {
-						refusalText = p.Text
-					}
-					result = append(result, map[string]interface{}{
-						"type":    "refusal",
-						"refusal": refusalText,
-					})
-				default:
-					var unknown map[string]interface{}
-					b, _ := json.Marshal(p)
-					json.Unmarshal(b, &unknown)
-					result = append(result, unknown)
+			case "refusal":
+				refusalText := p.Refusal
+				if refusalText == "" {
+					refusalText = p.Text
+				}
+				result = append(result, map[string]interface{}{
+					"type":    "refusal",
+					"refusal": refusalText,
+				})
+			default:
+				var unknown map[string]interface{}
+				b, _ := json.Marshal(p)
+				json.Unmarshal(b, &unknown)
+				result = append(result, unknown)
 			}
 		}
 		return result
@@ -762,9 +1020,24 @@ func convertResponsesContentToChat(raw json.RawMessage) interface{} {
 	return raw2
 }
 
+func isEmptyBase64DataURI(raw string) bool {
+	if !strings.HasPrefix(raw, "data:") {
+		return false
+	}
+	rest := strings.TrimPrefix(raw, "data:")
+	semicolonIdx := strings.Index(rest, ";")
+	if semicolonIdx < 0 {
+		return false
+	}
+	rest = rest[semicolonIdx+1:]
+	if !strings.HasPrefix(rest, "base64,") {
+		return false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(rest, "base64,")) == ""
+}
+
 // ==================== Structured Output Conversion ====================
 
-// convertResponseFormatToText converts Chat Completions response_format → Responses text.format
 func convertResponseFormatToText(rf json.RawMessage) map[string]interface{} {
 	var rfObj ResponseFormatObj
 	if err := json.Unmarshal(rf, &rfObj); err != nil {
@@ -778,9 +1051,7 @@ func convertResponseFormatToText(rf json.RawMessage) map[string]interface{} {
 
 	switch rfObj.Type {
 	case "json_object":
-		result["format"] = map[string]interface{}{
-			"type": "json_object",
-		}
+		result["format"] = map[string]interface{}{"type": "json_object"}
 	case "json_schema":
 		if rfObj.JSONSchema != nil {
 			format := map[string]interface{}{
@@ -801,11 +1072,8 @@ func convertResponseFormatToText(rf json.RawMessage) map[string]interface{} {
 			result["format"] = format
 		}
 	case "text":
-		result["format"] = map[string]interface{}{
-			"type": "text",
-		}
+		result["format"] = map[string]interface{}{"type": "text"}
 	default:
-		// Pass through
 		var raw interface{}
 		json.Unmarshal(rf, &raw)
 		result["format"] = raw
@@ -814,23 +1082,19 @@ func convertResponseFormatToText(rf json.RawMessage) map[string]interface{} {
 	return result
 }
 
-// convertTextToResponseFormat converts Responses text.format → Chat Completions response_format
 func convertTextToResponseFormat(text json.RawMessage) interface{} {
 	var tf ResponsesTextFormat
 	if err := json.Unmarshal(text, &tf); err != nil {
 		return nil
 	}
 
-	// If no format specified (e.g., only verbosity), skip response_format
 	if tf.Format.Type == "" {
 		return nil
 	}
 
 	switch tf.Format.Type {
 	case "json_object":
-		return map[string]interface{}{
-			"type": "json_object",
-		}
+		return map[string]interface{}{"type": "json_object"}
 	case "json_schema":
 		result := map[string]interface{}{
 			"type": "json_schema",
@@ -852,13 +1116,9 @@ func convertTextToResponseFormat(text json.RawMessage) interface{} {
 		}
 		return result
 	case "text":
-		return map[string]interface{}{
-			"type": "text",
-		}
+		return map[string]interface{}{"type": "text"}
 	default:
-		return map[string]interface{}{
-			"type": tf.Format.Type,
-		}
+		return map[string]interface{}{"type": tf.Format.Type}
 	}
 }
 
@@ -881,4 +1141,9 @@ var idCounter uint64
 func generateID(prefix string) string {
 	count := atomic.AddUint64(&idCounter, 1)
 	return fmt.Sprintf("%s%d_%d", prefix, time.Now().UnixNano(), count)
+}
+
+func mustMarshal(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
