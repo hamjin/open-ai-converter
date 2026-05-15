@@ -20,6 +20,8 @@ type Config struct {
 
 	Host string
 	Port int
+
+	CacheDir string
 }
 
 var cfg Config
@@ -32,6 +34,7 @@ func loadConfig() {
 	flag.StringVar(&cfg.CompletionsAPIKey, "completions-key", envOrDefault("COMPLETIONS_API_KEY", ""), "Upstream Chat Completions API key")
 	flag.StringVar(&cfg.Host, "host", envOrDefault("HOST", "0.0.0.0"), "Server host")
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
+	flag.StringVar(&cfg.CacheDir, "cache-dir", envOrDefault("CACHE_DIR", "cache"), "Directory for caching reasoning results")
 	flag.Parse()
 }
 

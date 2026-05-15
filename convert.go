@@ -4,10 +4,109 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// reasoningCache stores reasoning_content from upstream responses, keyed by tool_call ID.
+// Persisted to disk in conversations/reasoning_cache.json, retained for 7 days.
+type reasoningEntry struct {
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+var (
+	reasoningCache   sync.Map
+	reasoningCacheMu sync.Mutex
+	reasoningCacheLoaded bool
+)
+
+const reasoningCacheTTL = 7 * 24 * time.Hour
+
+func reasoningCachePath() string {
+	return filepath.Join(cfg.CacheDir, "reasoning_cache.json")
+}
+
+func loadReasoningCache() {
+	reasoningCacheMu.Lock()
+	defer reasoningCacheMu.Unlock()
+	if reasoningCacheLoaded {
+		return
+	}
+	reasoningCacheLoaded = true
+
+	data, err := os.ReadFile(reasoningCachePath())
+	if err != nil {
+		return
+	}
+	var entries map[string]reasoningEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return
+	}
+	now := time.Now()
+	for k, v := range entries {
+		if now.Sub(v.CreatedAt) < reasoningCacheTTL {
+			reasoningCache.Store(k, v)
+		}
+	}
+	log.Printf("[cache] loaded %d reasoning entries from disk", len(entries))
+}
+
+func saveReasoningCache() {
+	reasoningCacheMu.Lock()
+	defer reasoningCacheMu.Unlock()
+
+	entries := make(map[string]reasoningEntry)
+	now := time.Now()
+	reasoningCache.Range(func(k, v any) bool {
+		key, _ := k.(string)
+		entry, ok := v.(reasoningEntry)
+		if !ok {
+			return true
+		}
+		if now.Sub(entry.CreatedAt) < reasoningCacheTTL {
+			entries[key] = entry
+		}
+		return true
+	})
+
+	data, _ := json.Marshal(entries)
+	os.MkdirAll(cfg.CacheDir, 0755)
+	os.WriteFile(reasoningCachePath(), data, 0644)
+}
+
+func storeReasoningContent(toolCallID, content string) {
+	if toolCallID != "" && content != "" {
+		reasoningCache.Store(toolCallID, reasoningEntry{
+			Content:   content,
+			CreatedAt: time.Now(),
+		})
+		go saveReasoningCache()
+	}
+}
+
+func getReasoningContent(toolCallID string) string {
+	loadReasoningCache()
+	if v, ok := reasoningCache.Load(toolCallID); ok {
+		entry, _ := v.(reasoningEntry)
+		if time.Since(entry.CreatedAt) < reasoningCacheTTL {
+			return entry.Content
+		}
+		reasoningCache.Delete(toolCallID)
+	}
+	return ""
+}
+
+func evictReasoningCache() {
+	reasoningCache.Range(func(key, _ any) bool {
+		reasoningCache.Delete(key)
+		return true
+	})
+}
 
 // ==================== Chat Completions → Responses API ====================
 
@@ -308,6 +407,104 @@ func convertChatToolsToResponses(tools []ChatTool) []ResponsesTool {
 	return out
 }
 
+// stripUnsupportedSchemaFields recursively removes JSON Schema fields
+// not supported by the Chat Completions API from tool parameter schemas.
+// Removes: additionalProperties, $schema, $id, $ref, $defs, patternProperties,
+// if/then/else, dependencies, propertyNames, not at all levels.
+func stripUnsupportedSchemaFields(params json.RawMessage) json.RawMessage {
+	if params == nil {
+		return nil
+	}
+	var schema interface{}
+	if err := json.Unmarshal(params, &schema); err != nil {
+		return params
+	}
+	sanitizeSchemaNode(schema)
+	result, err := json.Marshal(schema)
+	if err != nil {
+		return params
+	}
+	return result
+}
+
+func sanitizeSchemaNode(node interface{}) {
+	m, ok := node.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	delete(m, "additionalProperties")
+	delete(m, "$schema")
+	delete(m, "$id")
+	delete(m, "$ref")
+	delete(m, "$defs")
+	delete(m, "patternProperties")
+	delete(m, "if")
+	delete(m, "then")
+	delete(m, "else")
+	delete(m, "dependencies")
+	delete(m, "propertyNames")
+	delete(m, "not")
+
+	if props, ok := m["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			sanitizeSchemaNode(v)
+		}
+	}
+	if items, ok := m["items"]; ok {
+		sanitizeSchemaNode(items)
+	}
+	// Recurse into combinator arrays
+	for _, key := range []string{"anyOf", "allOf", "oneOf"} {
+		if arr, ok := m[key].([]interface{}); ok {
+			for _, v := range arr {
+				sanitizeSchemaNode(v)
+			}
+		}
+	}
+}
+
+// reorderToolMessages ensures tool messages immediately follow their
+// corresponding assistant tool_calls message. Chat Completions requires:
+//
+//	assistant(tool_calls) → tool(result) [→ tool(result)...] → [assistant(text)]
+//
+// The Responses API allows interleaved ordering, so we must reorder.
+func reorderToolMessages(msgs []ChatMessage) []ChatMessage {
+	// Pass 1: collect tool results keyed by call_id
+	toolResults := make(map[string][]ChatMessage)
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			toolResults[m.ToolCallID] = append(toolResults[m.ToolCallID], m)
+		}
+	}
+	if len(toolResults) == 0 {
+		return msgs
+	}
+
+	// Pass 2: insert tool results right after their assistant(tool_calls)
+	var result []ChatMessage
+	for _, m := range msgs {
+		// Skip tool messages — they are re-inserted after their assistant
+		if m.Role == "tool" {
+			continue
+		}
+		result = append(result, m)
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				result = append(result, toolResults[tc.ID]...)
+				delete(toolResults, tc.ID)
+			}
+		}
+	}
+
+	// Append any orphaned tool results (no matching assistant found)
+	for _, tools := range toolResults {
+		result = append(result, tools...)
+	}
+	return result
+}
+
 // ==================== Responses API → Chat Completions (Non-Streaming) ====================
 
 func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletionsResponse, error) {
@@ -454,11 +651,19 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 		} else {
 			var inputMsgs []json.RawMessage
 			if err := json.Unmarshal(respReq.Input, &inputMsgs); err == nil {
+				var pendingReasoning string
 				for _, rawMsg := range inputMsgs {
 					var im ResponsesInputMessage
 					json.Unmarshal(rawMsg, &im)
 
 					switch {
+					case im.Type == "reasoning":
+						for _, s := range im.Summary {
+							if s.Type == "summary_text" && s.Text != "" {
+								pendingReasoning += s.Text
+							}
+						}
+						continue
 					case im.Type == "function_call_output":
 						messages = append(messages, ChatMessage{
 							Role:       "tool",
@@ -466,8 +671,9 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 							ToolCallID: im.CallID,
 						})
 					case im.Type == "function_call":
-						messages = append(messages, ChatMessage{
-							Role: "assistant",
+						msg := ChatMessage{
+							Role:    "assistant",
+							Content: json.RawMessage("null"),
 							ToolCalls: []ToolCall{{
 								ID:   im.CallID,
 								Type: "function",
@@ -476,7 +682,13 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 									Arguments: im.Arguments,
 								},
 							}},
-						})
+						}
+						// Inject cached reasoning_content from previous upstream response.
+						// Some APIs require this field to be present (even empty) in thinking mode.
+						if rc := getReasoningContent(im.CallID); rc != "" {
+							msg.ReasoningContent = rc
+						}
+						messages = append(messages, msg)
 					default:
 						role := im.Role
 						if role == "" {
@@ -484,7 +696,13 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 						}
 						msg := ChatMessage{Role: role}
 						if im.Content != nil {
-							msg.Content = json.RawMessage(mustMarshal(convertResponsesContentToChat(im.Content)))
+							// Always produce plain string content.
+							// Array format [{type:"text",text:"..."}] is spec-valid
+							// but rejected by many upstream proxies.
+							text := contentToString(im.Content)
+							if text != "" {
+								msg.Content = jsonString(text)
+							}
 							// Extract refusal
 							var parts []ResponsesContentPart
 							if err := json.Unmarshal(im.Content, &parts); err == nil {
@@ -502,7 +720,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 			}
 		}
 	}
-	chatReq.Messages = messages
+	chatReq.Messages = reorderToolMessages(messages)
 
 	// Parameter mapping
 	if respReq.MaxOutputTokens != nil {
@@ -564,7 +782,8 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 								delete(paramsMap, "strict")
 							}
 						}
-						fn.Parameters = json.RawMessage(mustMarshal(params))
+						rawParams := json.RawMessage(mustMarshal(params))
+						fn.Parameters = stripUnsupportedSchemaFields(rawParams)
 					}
 					if strict, ok := rt["strict"].(bool); ok {
 						fn.Strict = &strict
@@ -590,7 +809,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 							fn.Description = desc
 						}
 						if params, ok := nt["parameters"]; ok {
-							fn.Parameters = json.RawMessage(mustMarshal(params))
+							fn.Parameters = stripUnsupportedSchemaFields(json.RawMessage(mustMarshal(params)))
 						}
 						if strict, ok := nt["strict"].(bool); ok {
 							fn.Strict = &strict
@@ -614,7 +833,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 
 // ==================== Chat Completions Response → Responses API Response ====================
 
-func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*ResponsesResponse, error) {
+func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse, reasoningEffort string, reasoningSummary string) (*ResponsesResponse, error) {
 	respResp := &ResponsesResponse{
 		ID:          convertID(chatResp.ID, "resp_"),
 		Object:      "response",
@@ -622,6 +841,20 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 		Status:      "completed",
 		Model:       chatResp.Model,
 		ServiceTier: chatResp.ServiceTier,
+	}
+
+	// Build reasoning field from real values
+	if reasoningEffort != "" || reasoningSummary != "" {
+		if reasoningSummary != "" {
+			summaryJSON, _ := json.Marshal([]map[string]interface{}{
+				{"type": "summary_text", "text": reasoningSummary},
+			})
+			reasoning := fmt.Sprintf(`{"effort":%q,"summary":%s}`, reasoningEffort, summaryJSON)
+			respResp.Reasoning = json.RawMessage(reasoning)
+		} else {
+			reasoning := fmt.Sprintf(`{"effort":%q,"summary":null}`, reasoningEffort)
+			respResp.Reasoning = json.RawMessage(reasoning)
+		}
 	}
 
 	for _, choice := range chatResp.Choices {
@@ -669,6 +902,19 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
 				CallID:    tc.ID,
+			})
+		}
+
+		// Include reasoning_content as a reasoning output item
+		if msg.ReasoningContent != "" {
+			respResp.Output = append(respResp.Output, OutputItem{
+				ID:     fmt.Sprintf("reasoning_%d", time.Now().UnixNano()),
+				Type:   "reasoning",
+				Status: "completed",
+				Summary: []ResponsesSummary{{
+					Type: "summary_text",
+					Text: msg.ReasoningContent,
+				}},
 			})
 		}
 	}

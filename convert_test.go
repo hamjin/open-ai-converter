@@ -182,22 +182,18 @@ func TestConvertResponsesToChat_AssistantMessageOutputText(t *testing.T) {
 		t.Fatalf("conversion error: %v", err)
 	}
 
-	// Assistant message content
+	// Assistant message content — should be a plain string, not an array
 	assistantMsg := chatReq.Messages[1]
 	if assistantMsg.Role != "assistant" {
 		t.Errorf("msg[1] role = %v, want assistant", assistantMsg.Role)
 	}
 
-	var content []map[string]interface{}
-	json.Unmarshal(assistantMsg.Content, &content)
-	if len(content) != 1 {
-		t.Fatalf("msg[1] content count = %d, want 1", len(content))
+	var text string
+	if err := json.Unmarshal(assistantMsg.Content, &text); err != nil {
+		t.Fatalf("msg[1] content is not a string: %v (raw: %s)", err, string(assistantMsg.Content))
 	}
-	if content[0]["type"] != "text" {
-		t.Errorf("content type = %v, want text", content[0]["type"])
-	}
-	if content[0]["text"] != "Hi there!" {
-		t.Errorf("content text = %v, want 'Hi there!'", content[0]["text"])
+	if text != "Hi there!" {
+		t.Errorf("msg[1] content = %q, want 'Hi there!'", text)
 	}
 }
 
@@ -330,7 +326,7 @@ func TestConvertChatRespToResponsesResp_ToolCallOnlyNoEmptyMessage(t *testing.T)
 		},
 	}
 
-	respResp, err := ConvertChatRespToResponsesResp(chatResp)
+	respResp, err := ConvertChatRespToResponsesResp(chatResp, "", "")
 	if err != nil {
 		t.Fatalf("conversion error: %v", err)
 	}
@@ -1019,5 +1015,154 @@ func TestFinalizeResponsesChatStream(t *testing.T) {
 	chunks2 := FinalizeResponsesChatStream(state)
 	if chunks2 != nil {
 		t.Errorf("second finalize should return nil, got %d chunks", len(chunks2))
+	}
+}
+
+func TestStripUnsupportedSchemaFields_DeepNesting(t *testing.T) {
+	input := json.RawMessage(`{
+		"type": "object",
+		"additionalProperties": false,
+		"properties": {
+			"tags": {
+				"type": "array",
+				"items": {
+					"type": "object",
+					"additionalProperties": false,
+					"properties": {
+						"name": {"type": "string"}
+					}
+				}
+			},
+			"config": {
+				"type": "object",
+				"additionalProperties": {"type": "string"},
+				"properties": {
+					"key": {"type": "string", "additionalProperties": false}
+				}
+			}
+		}
+	}`)
+
+	result := stripUnsupportedSchemaFields(input)
+
+	var m map[string]interface{}
+	json.Unmarshal(result, &m)
+
+	if _, ok := m["additionalProperties"]; ok {
+		t.Error("root additionalProperties not stripped")
+	}
+
+	props := m["properties"].(map[string]interface{})
+	items := props["tags"].(map[string]interface{})["items"].(map[string]interface{})
+	if _, ok := items["additionalProperties"]; ok {
+		t.Error("items.additionalProperties not stripped")
+	}
+	config := props["config"].(map[string]interface{})
+	if _, ok := config["additionalProperties"]; ok {
+		t.Error("config.additionalProperties not stripped")
+	}
+	key := config["properties"].(map[string]interface{})["key"].(map[string]interface{})
+	if _, ok := key["additionalProperties"]; ok {
+		t.Error("nested property additionalProperties not stripped")
+	}
+}
+
+func TestStripUnsupportedSchemaFields_RemovesSchemaFields(t *testing.T) {
+	input := json.RawMessage(`{
+		"type": "object",
+		"$schema": "http://json-schema.org/draft-07/schema#",
+		"$id": "https://example.com/schema",
+		"patternProperties": {"^S_": {"type": "string"}},
+		"properties": {
+			"name": {"type": "string", "$ref": "#/defs/Name"}
+		}
+	}`)
+
+	result := stripUnsupportedSchemaFields(input)
+
+	var m map[string]interface{}
+	json.Unmarshal(result, &m)
+
+	for _, field := range []string{"$schema", "$id", "patternProperties"} {
+		if _, ok := m[field]; ok {
+			t.Errorf("field %q not stripped from root", field)
+		}
+	}
+
+	name := m["properties"].(map[string]interface{})["name"].(map[string]interface{})
+	if _, ok := name["$ref"]; ok {
+		t.Error("$ref not stripped from nested property")
+	}
+}
+
+func TestStripUnsupportedSchemaFields_AnyOf(t *testing.T) {
+	input := json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"items": {
+				"type": "array",
+				"items": {
+					"anyOf": [
+						{
+							"additionalProperties": false,
+							"type": "object",
+							"properties": {"a": {"type": "string"}}
+						},
+						{
+							"additionalProperties": true,
+							"type": "object"
+						}
+					]
+				}
+			}
+		}
+	}`)
+
+	result := stripUnsupportedSchemaFields(input)
+	var m map[string]interface{}
+	json.Unmarshal(result, &m)
+
+	items := m["properties"].(map[string]interface{})["items"].(map[string]interface{})["items"].(map[string]interface{})
+	arr := items["anyOf"].([]interface{})
+	for i, v := range arr {
+		node := v.(map[string]interface{})
+		if _, ok := node["additionalProperties"]; ok {
+			t.Errorf("anyOf[%d] additionalProperties not stripped", i)
+		}
+	}
+}
+
+func TestReorderToolMessages_InterleavedAssistantText(t *testing.T) {
+	// Reproduces the exact log case: function_call → assistant text → function_call_output
+	inputJSON := `[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the error"}]},
+		{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Let me look."}]},
+		{"type":"function_call_output","call_id":"call_1","output":"output here"}
+	]`
+
+	respReq := &ResponsesRequest{Model: "mimo", Input: json.RawMessage(inputJSON)}
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Expected: user → assistant(tool_calls) → tool → assistant(text)
+	roles := make([]string, len(chatReq.Messages))
+	for i, m := range chatReq.Messages {
+		roles[i] = m.Role
+	}
+	expected := []string{"user", "assistant", "tool", "assistant"}
+	if len(roles) != len(expected) {
+		t.Fatalf("message count = %d, want %d: %v", len(roles), len(expected), roles)
+	}
+	for i, want := range expected {
+		if roles[i] != want {
+			t.Errorf("msg[%d] role = %q, want %q (full: %v)", i, roles[i], want, roles)
+		}
+	}
+	// Tool message must follow assistant with tool_calls
+	if chatReq.Messages[2].ToolCallID != "call_1" {
+		t.Errorf("tool msg tool_call_id = %q, want call_1", chatReq.Messages[2].ToolCallID)
 	}
 }

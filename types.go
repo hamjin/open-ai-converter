@@ -177,15 +177,16 @@ type ResponsesRequest struct {
 }
 
 type ResponsesInputMessage struct {
-	Role      string          `json:"role,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
-	Type      string          `json:"type,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Output    string          `json:"output,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments string          `json:"arguments,omitempty"`
-	Status    string          `json:"status,omitempty"`
+	Role      string             `json:"role,omitempty"`
+	Content   json.RawMessage    `json:"content,omitempty"`
+	Type      string             `json:"type,omitempty"`
+	CallID    string             `json:"call_id,omitempty"`
+	Output    string             `json:"output,omitempty"`
+	ID        string             `json:"id,omitempty"`
+	Name      string             `json:"name,omitempty"`
+	Arguments string             `json:"arguments,omitempty"`
+	Status    string             `json:"status,omitempty"`
+	Summary   []ResponsesSummary `json:"summary,omitempty"`
 }
 
 type ResponsesResponse struct {
