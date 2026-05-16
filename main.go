@@ -33,6 +33,14 @@ type Config struct {
 	ReasoningEffortMap            map[string]string
 	ReasoningEffortMapTransparent bool
 	ReasoningEffortMapConvert     bool
+
+	// When true, forward the client's Authorization header to upstream.
+	// When false, always replace it with the configured upstream key.
+	// Effective passthrough = mode flag AND upstream-API flag (both must be true).
+	APIKeyPassthroughTransparent   bool
+	APIKeyPassthroughConvert       bool
+	APIKeyPassthroughResponsesAPI  bool
+	APIKeyPassthroughCompletionsAPI bool
 }
 
 var cfg Config
@@ -51,6 +59,10 @@ func loadConfig() {
 	flag.BoolVar(&cfg.ModelMapConvert, "model-map-convert", envOrDefault("MODEL_MAP_CONVERT_ENABLED", "true") == "true", "Enable MODEL_MAP in conversion mode")
 	flag.BoolVar(&cfg.ReasoningEffortMapTransparent, "reasoning-effort-map-transparent", envOrDefault("REASONING_EFFORT_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable REASONING_EFFORT_MAP in transparent pass-through mode")
 	flag.BoolVar(&cfg.ReasoningEffortMapConvert, "reasoning-effort-map-convert", envOrDefault("REASONING_EFFORT_MAP_CONVERT_ENABLED", "true") == "true", "Enable REASONING_EFFORT_MAP in conversion mode")
+	flag.BoolVar(&cfg.APIKeyPassthroughTransparent, "api-key-passthrough-transparent", envOrDefault("API_KEY_PASSTHROUGH_TRANSPARENT_ENABLED", "true") == "true", "Pass client Authorization through to upstream in transparent mode (false = always use configured key)")
+	flag.BoolVar(&cfg.APIKeyPassthroughConvert, "api-key-passthrough-convert", envOrDefault("API_KEY_PASSTHROUGH_CONVERT_ENABLED", "true") == "true", "Pass client Authorization through to upstream in conversion mode (false = always use configured key)")
+	flag.BoolVar(&cfg.APIKeyPassthroughResponsesAPI, "api-key-passthrough-responses", envOrDefault("API_KEY_PASSTHROUGH_RESPONSES_ENABLED", "true") == "true", "Pass client Authorization through to upstream Responses API (false = always use configured key)")
+	flag.BoolVar(&cfg.APIKeyPassthroughCompletionsAPI, "api-key-passthrough-completions", envOrDefault("API_KEY_PASSTHROUGH_COMPLETIONS_ENABLED", "true") == "true", "Pass client Authorization through to upstream Chat Completions API (false = always use configured key)")
 	flag.Parse()
 
 	// Parse model mapping from env (supports multi-line JSON)
@@ -164,6 +176,7 @@ func main() {
 	} else {
 		log.Println("  Reasoning effort map: DISABLED (set REASONING_EFFORT_MAP={...} to enable)")
 	}
+	log.Printf("  API key passthrough: transparent=%v convert=%v responses=%v completions=%v (effective = mode AND api)", cfg.APIKeyPassthroughTransparent, cfg.APIKeyPassthroughConvert, cfg.APIKeyPassthroughResponsesAPI, cfg.APIKeyPassthroughCompletionsAPI)
 	log.Println("")
 	log.Println("  /v1/chat/completions → upstream Responses API")
 	log.Println("  /v1/responses        → upstream Chat Completions API")

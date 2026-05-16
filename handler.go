@@ -62,10 +62,7 @@ func mapReasoningEffortInJSON(data []byte, m map[string]string, logPrefix string
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	apiKey := extractAPIKey(r)
-	if apiKey == "" {
-		apiKey = cfg.ResponsesAPIKey
-	}
+	apiKey := resolveAPIKey(r, cfg.ResponsesAPIKey, cfg.APIKeyPassthroughConvert && cfg.APIKeyPassthroughResponsesAPI)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -282,10 +279,7 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 // ==================== Direction 2: /v1/responses → upstream /v1/chat/completions ====================
 
 func handleResponses(w http.ResponseWriter, r *http.Request) {
-	apiKey := extractAPIKey(r)
-	if apiKey == "" {
-		apiKey = cfg.CompletionsAPIKey
-	}
+	apiKey := resolveAPIKey(r, cfg.CompletionsAPIKey, cfg.APIKeyPassthroughConvert && cfg.APIKeyPassthroughCompletionsAPI)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1091,10 +1085,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 // ==================== Pass-through ====================
 
 func handlePassthrough(w http.ResponseWriter, r *http.Request) {
-	apiKey := extractAPIKey(r)
-	if apiKey == "" {
-		apiKey = cfg.ResponsesAPIKey
-	}
+	apiKey := resolveAPIKey(r, cfg.ResponsesAPIKey, cfg.APIKeyPassthroughTransparent && cfg.APIKeyPassthroughResponsesAPI)
 
 	upstreamURL := cfg.ResponsesAPIBaseURL + r.URL.Path
 	if r.URL.RawQuery != "" {
@@ -1157,10 +1148,7 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 // ==================== Transparent Pass-through ====================
 
 func handleTransparent(w http.ResponseWriter, r *http.Request) {
-	apiKey := extractAPIKey(r)
-	if apiKey == "" {
-		apiKey = cfg.ResponsesAPIKey
-	}
+	apiKey := resolveAPIKey(r, cfg.ResponsesAPIKey, cfg.APIKeyPassthroughTransparent && cfg.APIKeyPassthroughResponsesAPI)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1315,6 +1303,18 @@ func extractAPIKey(r *http.Request) string {
 		return strings.TrimPrefix(auth, "Bearer ")
 	}
 	return ""
+}
+
+// resolveAPIKey picks the API key forwarded upstream.
+// passthrough=true  → prefer the client's Authorization (fallback to upstreamKey).
+// passthrough=false → always use upstreamKey, ignoring the client header.
+func resolveAPIKey(r *http.Request, upstreamKey string, passthrough bool) string {
+	if passthrough {
+		if k := extractAPIKey(r); k != "" {
+			return k
+		}
+	}
+	return upstreamKey
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
