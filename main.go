@@ -51,7 +51,7 @@ var cfg Config
 
 func loadConfig() {
 	// Command line flags (override env vars)
-	flag.StringVar(&cfg.ResponsesAPIBaseURL, "responses-url", envOrDefault("RESPONSES_API_BASE_URL", "https://codex.viloze.com"), "Upstream Responses API base URL")
+	flag.StringVar(&cfg.ResponsesAPIBaseURL, "responses-url", envOrDefault("RESPONSES_API_BASE_URL", "https://api.openai.com"), "Upstream Responses API base URL")
 	flag.StringVar(&cfg.ResponsesAPIKey, "responses-key", envOrDefault("RESPONSES_API_KEY", ""), "Upstream Responses API key")
 	flag.StringVar(&cfg.CompletionsAPIBaseURL, "completions-url", envOrDefault("COMPLETIONS_API_BASE_URL", "https://api.openai.com"), "Upstream Chat Completions API base URL")
 	flag.StringVar(&cfg.CompletionsAPIKey, "completions-key", envOrDefault("COMPLETIONS_API_KEY", ""), "Upstream Chat Completions API key")
