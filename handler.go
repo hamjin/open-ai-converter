@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -26,7 +25,7 @@ func mapModelInJSON(data []byte, old, new string) []byte {
 // shape) and nested `reasoning.effort` (Responses shape) when the value matches a key
 // in the supplied map. Returns the original body untouched when nothing changed or the
 // payload is not a JSON object.
-func mapReasoningEffortInJSON(data []byte, m map[string]string, logPrefix string) []byte {
+func mapReasoningEffortInJSON(data []byte, m map[string]string, rl *RequestLogger, logPrefix string) []byte {
 	if len(m) == 0 {
 		return data
 	}
@@ -38,7 +37,8 @@ func mapReasoningEffortInJSON(data []byte, m map[string]string, logPrefix string
 	if v, ok := doc["reasoning_effort"].(string); ok {
 		if mapped, ok2 := m[v]; ok2 {
 			doc["reasoning_effort"] = mapped
-			log.Printf("%s reasoning_effort mapping: %s → %s", logPrefix, v, mapped)
+			rl.Filef("%s reasoning_effort mapping: %s → %s", logPrefix, v, mapped)
+			rl.SetEffortMapping(v, mapped)
 			changed = true
 		}
 	}
@@ -46,7 +46,8 @@ func mapReasoningEffortInJSON(data []byte, m map[string]string, logPrefix string
 		if v, ok := rsn["effort"].(string); ok {
 			if mapped, ok2 := m[v]; ok2 {
 				rsn["effort"] = mapped
-				log.Printf("%s reasoning.effort mapping: %s → %s", logPrefix, v, mapped)
+				rl.Filef("%s reasoning.effort mapping: %s → %s", logPrefix, v, mapped)
+				rl.SetEffortMapping(v, mapped)
 				changed = true
 			}
 		}
@@ -62,27 +63,34 @@ func mapReasoningEffortInJSON(data []byte, m map[string]string, logPrefix string
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	rl := LoggerFromReq(r)
 	apiKey := resolveAPIKey(r, cfg.ResponsesAPIKey, cfg.APIKeyPassthroughConvert && cfg.APIKeyPassthroughResponsesAPI)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+		writeError(r, w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 	defer r.Body.Close()
 
 	var chatReq ChatCompletionsRequest
 	if err := json.Unmarshal(body, &chatReq); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeError(r, w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	log.Printf("[chat→resp] model=%s stream=%v messages=%d", chatReq.Model, chatReq.Stream, len(chatReq.Messages))
+	rl.Filef("[chat→resp] model=%s stream=%v messages=%d", chatReq.Model, chatReq.Stream, len(chatReq.Messages))
+	rl.SetStream(chatReq.Stream)
+	rl.SetModelMapping(chatReq.Model, chatReq.Model)
+	if chatReq.ReasoningEffort != nil {
+		rl.SetEffortMapping(*chatReq.ReasoningEffort, *chatReq.ReasoningEffort)
+	}
 
 	// Apply model mapping: client model → upstream model
 	if cfg.ModelMapConvert {
 		if mapped, ok := cfg.ModelMap[chatReq.Model]; ok {
-			log.Printf("[chat→resp] model mapping: %s → %s", chatReq.Model, mapped)
+			rl.Filef("[chat→resp] model mapping: %s → %s", chatReq.Model, mapped)
+			rl.SetModelMapping(chatReq.Model, mapped)
 			chatReq.Model = mapped
 		}
 	}
@@ -90,22 +98,24 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Apply reasoning_effort mapping (forces unsupported values down to allowed ones)
 	if cfg.ReasoningEffortMapConvert && chatReq.ReasoningEffort != nil {
 		if mapped, ok := cfg.ReasoningEffortMap[*chatReq.ReasoningEffort]; ok {
-			log.Printf("[chat→resp] reasoning_effort mapping: %s → %s", *chatReq.ReasoningEffort, mapped)
+			rl.Filef("[chat→resp] reasoning_effort mapping: %s → %s", *chatReq.ReasoningEffort, mapped)
+			rl.SetEffortMapping(*chatReq.ReasoningEffort, mapped)
 			chatReq.ReasoningEffort = &mapped
 		}
 	}
 
 	respReq, err := ConvertChatToResponsesRequest(&chatReq)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
+		writeError(r, w, http.StatusInternalServerError, "conversion error: "+err.Error())
 		return
 	}
 
 	respBody, err := json.Marshal(respReq)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "marshal error: "+err.Error())
+		writeError(r, w, http.StatusInternalServerError, "marshal error: "+err.Error())
 		return
 	}
+	rl.WriteConvertedRequest(respBody)
 
 	upstreamURL := cfg.ResponsesAPIBaseURL + "/v1/responses"
 
@@ -119,14 +129,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func handleChatNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, originalModel string) {
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to read upstream response")
+		writeError(r, w, http.StatusBadGateway, "failed to read upstream response")
 		return
 	}
 
@@ -139,13 +149,13 @@ func handleChatNonStream(r *http.Request, w http.ResponseWriter, url, apiKey str
 
 	var respResp ResponsesResponse
 	if err := json.Unmarshal(respBody, &respResp); err != nil {
-		writeError(w, http.StatusBadGateway, "failed to parse upstream response: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "failed to parse upstream response: "+err.Error())
 		return
 	}
 
 	chatResp, err := ConvertResponsesRespToChatResp(&respResp)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
+		writeError(r, w, http.StatusInternalServerError, "conversion error: "+err.Error())
 		return
 	}
 
@@ -159,7 +169,7 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 	model = originalModel // Use client model in all responses
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -174,7 +184,7 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		writeError(r, w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 
@@ -283,24 +293,30 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+		writeError(r, w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 	defer r.Body.Close()
 
 	var respReq ResponsesRequest
 	if err := json.Unmarshal(body, &respReq); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeError(r, w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	log.Printf("[POST] %s %s", r.URL.Path, r.RemoteAddr)
-	log.Printf("[resp→chat] model=%s stream=%v", respReq.Model, respReq.Stream)
+	rl := LoggerFromReq(r)
+	rl.Filef("[resp→chat] model=%s stream=%v", respReq.Model, respReq.Stream)
+	rl.SetStream(respReq.Stream)
+	rl.SetModelMapping(respReq.Model, respReq.Model)
+	if respReq.Reasoning != nil && respReq.Reasoning.Effort != "" {
+		rl.SetEffortMapping(respReq.Reasoning.Effort, respReq.Reasoning.Effort)
+	}
 
 	// Apply model mapping: client model → upstream model
 	if cfg.ModelMapConvert {
 		if mapped, ok := cfg.ModelMap[respReq.Model]; ok {
-			log.Printf("[resp→chat] model mapping: %s → %s", respReq.Model, mapped)
+			rl.Filef("[resp→chat] model mapping: %s → %s", respReq.Model, mapped)
+			rl.SetModelMapping(respReq.Model, mapped)
 			respReq.Model = mapped
 		}
 	}
@@ -308,22 +324,24 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	// Apply reasoning_effort mapping on nested reasoning.effort
 	if cfg.ReasoningEffortMapConvert && respReq.Reasoning != nil && respReq.Reasoning.Effort != "" {
 		if mapped, ok := cfg.ReasoningEffortMap[respReq.Reasoning.Effort]; ok {
-			log.Printf("[resp→chat] reasoning.effort mapping: %s → %s", respReq.Reasoning.Effort, mapped)
+			rl.Filef("[resp→chat] reasoning.effort mapping: %s → %s", respReq.Reasoning.Effort, mapped)
+			rl.SetEffortMapping(respReq.Reasoning.Effort, mapped)
 			respReq.Reasoning.Effort = mapped
 		}
 	}
 
 	chatReq, err := ConvertResponsesToChatRequest(&respReq)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
+		writeError(r, w, http.StatusInternalServerError, "conversion error: "+err.Error())
 		return
 	}
 
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "marshal error: "+err.Error())
+		writeError(r, w, http.StatusInternalServerError, "marshal error: "+err.Error())
 		return
 	}
+	rl.WriteConvertedRequest(chatBody)
 
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
 
@@ -337,14 +355,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, originalModel string) {
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to read upstream response")
+		writeError(r, w, http.StatusBadGateway, "failed to read upstream response")
 		return
 	}
 
@@ -357,7 +375,7 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 
 	var chatResp ChatCompletionsResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		writeError(w, http.StatusBadGateway, "failed to parse upstream response: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "failed to parse upstream response: "+err.Error())
 		return
 	}
 
@@ -382,7 +400,7 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 
 	responsesResp, err := ConvertChatRespToResponsesResp(&chatResp, reasoningEffort, reasoningContent)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
+		writeError(r, w, http.StatusInternalServerError, "conversion error: "+err.Error())
 		return
 	}
 
@@ -397,7 +415,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -411,7 +429,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		writeError(r, w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 
@@ -1100,7 +1118,7 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 
 	req, err := http.NewRequest(r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to create request")
+		writeError(r, w, http.StatusBadGateway, "failed to create request")
 		return
 	}
 
@@ -1131,10 +1149,13 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	if rl := LoggerFromReq(r); rl != nil {
+		resp.Body = rl.NewUpstreamBodyTeeCloser(resp.Body, resp.StatusCode, false)
+	}
 
 	for k, v := range resp.Header {
 		for _, vv := range v {
@@ -1152,7 +1173,7 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+		writeError(r, w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 	defer r.Body.Close()
@@ -1163,6 +1184,7 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply model mapping
+	rl := LoggerFromReq(r)
 	var clientModel, mappedModel string
 	if cfg.ModelMapTransparent && len(cfg.ModelMap) > 0 {
 		var partial struct {
@@ -1173,20 +1195,22 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 			clientModel = partial.Model
 			mappedModel = m
 			body = mapModelInJSON(body, clientModel, mappedModel)
-			log.Printf("[transparent] model mapping: %s → %s", clientModel, mappedModel)
+			rl.Filef("[transparent] model mapping: %s → %s", clientModel, mappedModel)
+			rl.SetModelMapping(clientModel, mappedModel)
 		}
 	}
 
 	// Apply reasoning_effort mapping (both Chat Completions and Responses shapes)
 	if cfg.ReasoningEffortMapTransparent && len(cfg.ReasoningEffortMap) > 0 {
-		body = mapReasoningEffortInJSON(body, cfg.ReasoningEffortMap, "[transparent]")
+		body = mapReasoningEffortInJSON(body, cfg.ReasoningEffortMap, rl, "[transparent]")
 	}
+	rl.WriteConvertedRequest(body)
 
-	log.Printf("[transparent] path=%s (%d bytes)", r.URL.Path, len(body))
+	rl.Filef("[transparent] path=%s (%d bytes)", r.URL.Path, len(body))
 
 	req, err := http.NewRequest(r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to create request")
+		writeError(r, w, http.StatusBadGateway, "failed to create request")
 		return
 	}
 
@@ -1219,14 +1243,19 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
+	transparentStreaming := strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+	if rl != nil {
+		rl.SetStream(transparentStreaming)
+		resp.Body = rl.NewUpstreamBodyTeeCloser(resp.Body, resp.StatusCode, transparentStreaming)
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to read upstream response")
+		writeError(r, w, http.StatusBadGateway, "failed to read upstream response")
 		return
 	}
 
@@ -1293,8 +1322,16 @@ func doUpstreamRequest(origReq *http.Request, url, apiKey string, body []byte, s
 		}
 	}
 
-	log.Printf("[upstream] POST %s (%d bytes) streaming=%v", url, len(body), streaming)
-	return httpClient.Do(req)
+	LoggerFromReq(origReq).Filef("[upstream] POST %s (%d bytes) streaming=%v", url, len(body), streaming)
+	resp, err := httpClient.Do(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if rl := LoggerFromReq(origReq); rl != nil {
+		rl.Filef("[upstream] status=%d content-type=%s", resp.StatusCode, resp.Header.Get("Content-Type"))
+		resp.Body = rl.NewUpstreamBodyTeeCloser(resp.Body, resp.StatusCode, streaming)
+	}
+	return resp, err
 }
 
 func extractAPIKey(r *http.Request) string {
@@ -1317,8 +1354,8 @@ func resolveAPIKey(r *http.Request, upstreamKey string, passthrough bool) string
 	return upstreamKey
 }
 
-func writeError(w http.ResponseWriter, code int, msg string) {
-	log.Printf("[error] %d: %s", code, msg)
+func writeError(r *http.Request, w http.ResponseWriter, code int, msg string) {
+	LoggerFromReq(r).Filef("[error] %d: %s", code, msg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]interface{}{

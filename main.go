@@ -24,6 +24,10 @@ type Config struct {
 
 	CacheDir string
 
+	LogEnabled        bool
+	ConvertLogDir     string
+	TransparentLogDir string
+
 	TransparentEnabled bool
 
 	ModelMap            map[string]string
@@ -37,9 +41,9 @@ type Config struct {
 	// When true, forward the client's Authorization header to upstream.
 	// When false, always replace it with the configured upstream key.
 	// Effective passthrough = mode flag AND upstream-API flag (both must be true).
-	APIKeyPassthroughTransparent   bool
-	APIKeyPassthroughConvert       bool
-	APIKeyPassthroughResponsesAPI  bool
+	APIKeyPassthroughTransparent    bool
+	APIKeyPassthroughConvert        bool
+	APIKeyPassthroughResponsesAPI   bool
 	APIKeyPassthroughCompletionsAPI bool
 }
 
@@ -54,6 +58,9 @@ func loadConfig() {
 	flag.StringVar(&cfg.Host, "host", envOrDefault("HOST", "0.0.0.0"), "Server host")
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
 	flag.StringVar(&cfg.CacheDir, "cache-dir", envOrDefault("CACHE_DIR", "cache"), "Directory for caching reasoning results")
+	flag.BoolVar(&cfg.LogEnabled, "log-enabled", envOrDefault("LOG_ENABLED", "false") == "true", "Enable request/response logging to files (false = console summary only)")
+	flag.StringVar(&cfg.ConvertLogDir, "convert-log-dir", envOrDefault("CONVERT_LOG_DIR", "conversations"), "Directory for conversion-mode request/response logs")
+	flag.StringVar(&cfg.TransparentLogDir, "transparent-log-dir", envOrDefault("TRANSPARENT_LOG_DIR", "conversations_t"), "Directory for transparent-mode request/response logs")
 	flag.BoolVar(&cfg.TransparentEnabled, "transparent", envOrDefault("TRANSPARENT_ENABLED", "false") == "true", "Enable transparent pass-through mode (no conversion)")
 	flag.BoolVar(&cfg.ModelMapTransparent, "model-map-transparent", envOrDefault("MODEL_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable MODEL_MAP in transparent pass-through mode")
 	flag.BoolVar(&cfg.ModelMapConvert, "model-map-convert", envOrDefault("MODEL_MAP_CONVERT_ENABLED", "true") == "true", "Enable MODEL_MAP in conversion mode")
@@ -161,6 +168,13 @@ func main() {
 	log.Printf("  Listening on: http://%s", addr)
 	log.Printf("  Responses upstream: %s", cfg.ResponsesAPIBaseURL)
 	log.Printf("  Completions upstream: %s", cfg.CompletionsAPIBaseURL)
+	if cfg.LogEnabled {
+		log.Printf("  Request logging: ENABLED")
+		log.Printf("  Convert log dir: %s", cfg.ConvertLogDir)
+		log.Printf("  Transparent log dir: %s", cfg.TransparentLogDir)
+	} else {
+		log.Println("  Request logging: DISABLED (set LOG_ENABLED=true to enable)")
+	}
 	if cfg.TransparentEnabled {
 		log.Printf("  Transparent mode: ENABLED")
 	} else {
@@ -182,7 +196,7 @@ func main() {
 	log.Println("  /v1/responses        → upstream Chat Completions API")
 	log.Println("========================================")
 
-	if err := http.ListenAndServe(addr, corsMiddleware(loggingMiddleware(mux))); err != nil {
+	if err := http.ListenAndServe(addr, corsMiddleware(conversationLoggingMiddleware(mux))); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }
@@ -199,14 +213,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		next.ServeHTTP(w, r)
-	})
-}
-
-// Logging middleware
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[%s] %s %s", r.Method, r.URL.Path, r.RemoteAddr)
 		next.ServeHTTP(w, r)
 	})
 }
