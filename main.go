@@ -29,6 +29,10 @@ type Config struct {
 	ModelMap            map[string]string
 	ModelMapTransparent bool
 	ModelMapConvert     bool
+
+	ReasoningEffortMap            map[string]string
+	ReasoningEffortMapTransparent bool
+	ReasoningEffortMapConvert     bool
 }
 
 var cfg Config
@@ -45,6 +49,8 @@ func loadConfig() {
 	flag.BoolVar(&cfg.TransparentEnabled, "transparent", envOrDefault("TRANSPARENT_ENABLED", "false") == "true", "Enable transparent pass-through mode (no conversion)")
 	flag.BoolVar(&cfg.ModelMapTransparent, "model-map-transparent", envOrDefault("MODEL_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable MODEL_MAP in transparent pass-through mode")
 	flag.BoolVar(&cfg.ModelMapConvert, "model-map-convert", envOrDefault("MODEL_MAP_CONVERT_ENABLED", "true") == "true", "Enable MODEL_MAP in conversion mode")
+	flag.BoolVar(&cfg.ReasoningEffortMapTransparent, "reasoning-effort-map-transparent", envOrDefault("REASONING_EFFORT_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable REASONING_EFFORT_MAP in transparent pass-through mode")
+	flag.BoolVar(&cfg.ReasoningEffortMapConvert, "reasoning-effort-map-convert", envOrDefault("REASONING_EFFORT_MAP_CONVERT_ENABLED", "true") == "true", "Enable REASONING_EFFORT_MAP in conversion mode")
 	flag.Parse()
 
 	// Parse model mapping from env (supports multi-line JSON)
@@ -52,6 +58,14 @@ func loadConfig() {
 	if mm := envOrDefault("MODEL_MAP", ""); mm != "" {
 		if err := json.Unmarshal([]byte(mm), &cfg.ModelMap); err != nil {
 			log.Printf("warning: MODEL_MAP parse error: %v", err)
+		}
+	}
+
+	// Parse reasoning_effort mapping from env (supports multi-line JSON)
+	cfg.ReasoningEffortMap = make(map[string]string)
+	if rm := envOrDefault("REASONING_EFFORT_MAP", ""); rm != "" {
+		if err := json.Unmarshal([]byte(rm), &cfg.ReasoningEffortMap); err != nil {
+			log.Printf("warning: REASONING_EFFORT_MAP parse error: %v", err)
 		}
 	}
 }
@@ -144,6 +158,11 @@ func main() {
 		log.Printf("  Model map: %d entries (transparent=%v convert=%v)", len(cfg.ModelMap), cfg.ModelMapTransparent, cfg.ModelMapConvert)
 	} else {
 		log.Println("  Model map: DISABLED (set MODEL_MAP={...} to enable)")
+	}
+	if len(cfg.ReasoningEffortMap) > 0 {
+		log.Printf("  Reasoning effort map: %d entries (transparent=%v convert=%v)", len(cfg.ReasoningEffortMap), cfg.ReasoningEffortMapTransparent, cfg.ReasoningEffortMapConvert)
+	} else {
+		log.Println("  Reasoning effort map: DISABLED (set REASONING_EFFORT_MAP={...} to enable)")
 	}
 	log.Println("")
 	log.Println("  /v1/chat/completions → upstream Responses API")

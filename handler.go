@@ -22,6 +22,45 @@ func mapModelInJSON(data []byte, old, new string) []byte {
 	return bytes.Replace(data, []byte(`"model":"`+old+`"`), []byte(`"model":"`+new+`"`), 1)
 }
 
+// mapReasoningEffortInJSON rewrites both top-level `reasoning_effort` (Chat Completions
+// shape) and nested `reasoning.effort` (Responses shape) when the value matches a key
+// in the supplied map. Returns the original body untouched when nothing changed or the
+// payload is not a JSON object.
+func mapReasoningEffortInJSON(data []byte, m map[string]string, logPrefix string) []byte {
+	if len(m) == 0 {
+		return data
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return data
+	}
+	changed := false
+	if v, ok := doc["reasoning_effort"].(string); ok {
+		if mapped, ok2 := m[v]; ok2 {
+			doc["reasoning_effort"] = mapped
+			log.Printf("%s reasoning_effort mapping: %s → %s", logPrefix, v, mapped)
+			changed = true
+		}
+	}
+	if rsn, ok := doc["reasoning"].(map[string]interface{}); ok {
+		if v, ok := rsn["effort"].(string); ok {
+			if mapped, ok2 := m[v]; ok2 {
+				rsn["effort"] = mapped
+				log.Printf("%s reasoning.effort mapping: %s → %s", logPrefix, v, mapped)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return data
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	apiKey := extractAPIKey(r)
 	if apiKey == "" {
@@ -48,6 +87,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if mapped, ok := cfg.ModelMap[chatReq.Model]; ok {
 			log.Printf("[chat→resp] model mapping: %s → %s", chatReq.Model, mapped)
 			chatReq.Model = mapped
+		}
+	}
+
+	// Apply reasoning_effort mapping (forces unsupported values down to allowed ones)
+	if cfg.ReasoningEffortMapConvert && chatReq.ReasoningEffort != nil {
+		if mapped, ok := cfg.ReasoningEffortMap[*chatReq.ReasoningEffort]; ok {
+			log.Printf("[chat→resp] reasoning_effort mapping: %s → %s", *chatReq.ReasoningEffort, mapped)
+			chatReq.ReasoningEffort = &mapped
 		}
 	}
 
@@ -261,6 +308,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		if mapped, ok := cfg.ModelMap[respReq.Model]; ok {
 			log.Printf("[resp→chat] model mapping: %s → %s", respReq.Model, mapped)
 			respReq.Model = mapped
+		}
+	}
+
+	// Apply reasoning_effort mapping on nested reasoning.effort
+	if cfg.ReasoningEffortMapConvert && respReq.Reasoning != nil && respReq.Reasoning.Effort != "" {
+		if mapped, ok := cfg.ReasoningEffortMap[respReq.Reasoning.Effort]; ok {
+			log.Printf("[resp→chat] reasoning.effort mapping: %s → %s", respReq.Reasoning.Effort, mapped)
+			respReq.Reasoning.Effort = mapped
 		}
 	}
 
@@ -1132,6 +1187,11 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 			body = mapModelInJSON(body, clientModel, mappedModel)
 			log.Printf("[transparent] model mapping: %s → %s", clientModel, mappedModel)
 		}
+	}
+
+	// Apply reasoning_effort mapping (both Chat Completions and Responses shapes)
+	if cfg.ReasoningEffortMapTransparent && len(cfg.ReasoningEffortMap) > 0 {
+		body = mapReasoningEffortInJSON(body, cfg.ReasoningEffortMap, "[transparent]")
 	}
 
 	log.Printf("[transparent] path=%s (%d bytes)", r.URL.Path, len(body))
