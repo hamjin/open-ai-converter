@@ -69,7 +69,7 @@ cp .env.example .env
 # 编辑 .env 填入你的 API 配置
 
 # 一键启动
-docker compose up -d
+docker compose --env-file /dev/null up -d
 
 # 查看日志
 docker compose logs -f
@@ -78,28 +78,13 @@ docker compose logs -f
 docker compose down
 ```
 
-也可以不创建 `.env` 文件，直接通过环境变量启动：
-
-```bash
-RESPONSES_API_BASE_URL=https://your-api.com \
-RESPONSES_API_KEY=sk-xxx \
-docker compose up -d
-```
-
-自定义端口：
-
-```bash
-PORT=8080 docker compose up -d
-# 服务将在 http://localhost:8080 启动
-```
-
 ### 使用预构建 Docker 镜像（最简单）
 
 无需克隆代码，直接拉取镜像运行：
 
 ```bash
 docker run -d --name openai-converter \
-  -p 9090:9090 \
+  -p 127.0.0.1:9090:9090 \
   -e RESPONSES_API_BASE_URL=https://your-api.com \
   -e RESPONSES_API_KEY=sk-xxx \
   -e COMPLETIONS_API_BASE_URL=https://api.openai.com \

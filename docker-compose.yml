@@ -4,19 +4,14 @@ services:
     container_name: openai-converter
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${PORT:-9090}:${PORT:-9090}"
-    environment:
-      # 方向1: 客户端发 Chat Completions 请求 → 代理转换为 Responses API 调用上游
-      - RESPONSES_API_BASE_URL=${RESPONSES_API_BASE_URL:-https://api.openai.com}
-      - RESPONSES_API_KEY=${RESPONSES_API_KEY:-}
-      # 方向2: 客户端发 Responses 请求 → 代理转换为 Chat Completions API 调用上游
-      - COMPLETIONS_API_BASE_URL=${COMPLETIONS_API_BASE_URL:-https://api.openai.com}
-      - COMPLETIONS_API_KEY=${COMPLETIONS_API_KEY:-}
-      # 服务器配置
-      - HOST=0.0.0.0
-      - PORT=${PORT:-9090}
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:$${PORT:-9090}/health"]
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/health"]
       interval: 30s
       timeout: 5s
       retries: 3
