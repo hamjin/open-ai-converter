@@ -22,6 +22,8 @@ type Config struct {
 	Port int
 
 	CacheDir string
+
+	TransparentEnabled bool
 }
 
 var cfg Config
@@ -35,6 +37,7 @@ func loadConfig() {
 	flag.StringVar(&cfg.Host, "host", envOrDefault("HOST", "0.0.0.0"), "Server host")
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
 	flag.StringVar(&cfg.CacheDir, "cache-dir", envOrDefault("CACHE_DIR", "cache"), "Directory for caching reasoning results")
+	flag.BoolVar(&cfg.TransparentEnabled, "transparent", envOrDefault("TRANSPARENT_ENABLED", "false") == "true", "Enable transparent pass-through mode (no conversion)")
 	flag.Parse()
 }
 
@@ -64,10 +67,18 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Direction 1: Client speaks Chat Completions, proxy converts to Responses API
-	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	if cfg.TransparentEnabled {
+		mux.HandleFunc("/v1/chat/completions", handleTransparent)
+	} else {
+		mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	}
 
 	// Direction 2: Client speaks Responses, proxy converts to Chat Completions API
-	mux.HandleFunc("/v1/responses", handleResponses)
+	if cfg.TransparentEnabled {
+		mux.HandleFunc("/v1/responses", handleTransparent)
+	} else {
+		mux.HandleFunc("/v1/responses", handleResponses)
+	}
 
 	// Pass-through for models and other endpoints
 	mux.HandleFunc("/v1/models", handlePassthrough)
@@ -109,6 +120,11 @@ func main() {
 	log.Printf("  Listening on: http://%s", addr)
 	log.Printf("  Responses upstream: %s", cfg.ResponsesAPIBaseURL)
 	log.Printf("  Completions upstream: %s", cfg.CompletionsAPIBaseURL)
+	if cfg.TransparentEnabled {
+		log.Printf("  Transparent mode: ENABLED")
+	} else {
+		log.Println("  Transparent mode: DISABLED (set TRANSPARENT_ENABLED=true to enable)")
+	}
 	log.Println("")
 	log.Println("  /v1/chat/completions → upstream Responses API")
 	log.Println("  /v1/responses        → upstream Chat Completions API")

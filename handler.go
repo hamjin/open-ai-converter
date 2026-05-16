@@ -1070,6 +1070,83 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+// ==================== Transparent Pass-through ====================
+
+func handleTransparent(w http.ResponseWriter, r *http.Request) {
+	apiKey := extractAPIKey(r)
+	if apiKey == "" {
+		apiKey = cfg.ResponsesAPIKey
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	defer r.Body.Close()
+
+	upstreamURL := cfg.ResponsesAPIBaseURL + r.URL.Path
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	log.Printf("[transparent] path=%s (%d bytes)", r.URL.Path, len(body))
+
+	req, err := http.NewRequest(r.Method, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to create request")
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	if r.Header.Get("Accept") != "" {
+		req.Header.Set("Accept", r.Header.Get("Accept"))
+	}
+
+	clientIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+		if !isPrivateOrLoopback(clientIP) {
+			req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+		} else {
+			req.Header.Set("X-Forwarded-For", prior)
+		}
+	} else if !isPrivateOrLoopback(clientIP) {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		req.Header.Set("X-Real-IP", realIP)
+	} else if !isPrivateOrLoopback(clientIP) {
+		req.Header.Set("X-Real-IP", clientIP)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to read upstream response")
+		return
+	}
+
+	for k, v := range resp.Header {
+		for _, vv := range v {
+			w.Header().Add(k, vv)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
 // ==================== Utilities ====================
 
 var httpClient = &http.Client{
