@@ -16,6 +16,12 @@ import (
 
 // ==================== Direction 1: /v1/chat/completions → upstream /v1/responses ====================
 
+// mapModelInJSON replaces the "model":"<old>" value in raw JSON with "model":"<new>".
+// Only matches the top-level model field to avoid replacing model names in message content.
+func mapModelInJSON(data []byte, old, new string) []byte {
+	return bytes.Replace(data, []byte(`"model":"`+old+`"`), []byte(`"model":"`+new+`"`), 1)
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	apiKey := extractAPIKey(r)
 	if apiKey == "" {
@@ -37,6 +43,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[chat→resp] model=%s stream=%v messages=%d", chatReq.Model, chatReq.Stream, len(chatReq.Messages))
 
+	// Apply model mapping: client model → upstream model
+	if cfg.ModelMapConvert {
+		if mapped, ok := cfg.ModelMap[chatReq.Model]; ok {
+			log.Printf("[chat→resp] model mapping: %s → %s", chatReq.Model, mapped)
+			chatReq.Model = mapped
+		}
+	}
+
 	respReq, err := ConvertChatToResponsesRequest(&chatReq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
@@ -52,13 +66,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := cfg.ResponsesAPIBaseURL + "/v1/responses"
 
 	if chatReq.Stream {
-		handleChatStreamViaResponses(r, w, upstreamURL, apiKey, respBody, chatReq.Model)
+		handleChatStreamViaResponses(r, w, upstreamURL, apiKey, respBody, chatReq.Model, chatReq.Model)
 	} else {
-		handleChatNonStream(r, w, upstreamURL, apiKey, respBody)
+		handleChatNonStream(r, w, upstreamURL, apiKey, respBody, chatReq.Model)
 	}
 }
 
-func handleChatNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte) {
+func handleChatNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, originalModel string) {
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -91,11 +105,14 @@ func handleChatNonStream(r *http.Request, w http.ResponseWriter, url, apiKey str
 		return
 	}
 
+	chatResp.Model = originalModel // Reverse-map to client model
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(chatResp)
 }
 
-func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
+func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string, originalModel string) {
+	model = originalModel // Use client model in all responses
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -239,6 +256,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[POST] %s %s", r.URL.Path, r.RemoteAddr)
 	log.Printf("[resp→chat] model=%s stream=%v", respReq.Model, respReq.Stream)
 
+	// Apply model mapping: client model → upstream model
+	if cfg.ModelMapConvert {
+		if mapped, ok := cfg.ModelMap[respReq.Model]; ok {
+			log.Printf("[resp→chat] model mapping: %s → %s", respReq.Model, mapped)
+			respReq.Model = mapped
+		}
+	}
+
 	chatReq, err := ConvertResponsesToChatRequest(&respReq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
@@ -254,13 +279,13 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
 
 	if respReq.Stream {
-		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, respReq.Model)
+		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, respReq.Model, respReq.Model)
 	} else {
-		handleResponsesNonStream(r, w, upstreamURL, apiKey, chatBody)
+		handleResponsesNonStream(r, w, upstreamURL, apiKey, chatBody, respReq.Model)
 	}
 }
 
-func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte) {
+func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, originalModel string) {
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -312,11 +337,15 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 		return
 	}
 
+	responsesResp.Model = originalModel // Reverse-map to client model
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(responsesResp)
 }
 
-func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
+func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string, originalModel string) {
+	model = originalModel // Use client model in all responses
+
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -1090,6 +1119,21 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
+	// Apply model mapping
+	var clientModel, mappedModel string
+	if cfg.ModelMapTransparent && len(cfg.ModelMap) > 0 {
+		var partial struct {
+			Model string `json:"model"`
+		}
+		json.Unmarshal(body, &partial)
+		if m, ok := cfg.ModelMap[partial.Model]; ok {
+			clientModel = partial.Model
+			mappedModel = m
+			body = mapModelInJSON(body, clientModel, mappedModel)
+			log.Printf("[transparent] model mapping: %s → %s", clientModel, mappedModel)
+		}
+	}
+
 	log.Printf("[transparent] path=%s (%d bytes)", r.URL.Path, len(body))
 
 	req, err := http.NewRequest(r.Method, upstreamURL, bytes.NewReader(body))
@@ -1136,6 +1180,11 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "failed to read upstream response")
 		return
+	}
+
+	// Reverse-map model in response so client sees original model
+	if clientModel != "" && mappedModel != "" {
+		respBody = mapModelInJSON(respBody, mappedModel, clientModel)
 	}
 
 	for k, v := range resp.Header {

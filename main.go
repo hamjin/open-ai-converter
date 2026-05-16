@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -24,6 +25,10 @@ type Config struct {
 	CacheDir string
 
 	TransparentEnabled bool
+
+	ModelMap            map[string]string
+	ModelMapTransparent bool
+	ModelMapConvert     bool
 }
 
 var cfg Config
@@ -38,7 +43,17 @@ func loadConfig() {
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
 	flag.StringVar(&cfg.CacheDir, "cache-dir", envOrDefault("CACHE_DIR", "cache"), "Directory for caching reasoning results")
 	flag.BoolVar(&cfg.TransparentEnabled, "transparent", envOrDefault("TRANSPARENT_ENABLED", "false") == "true", "Enable transparent pass-through mode (no conversion)")
+	flag.BoolVar(&cfg.ModelMapTransparent, "model-map-transparent", envOrDefault("MODEL_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable MODEL_MAP in transparent pass-through mode")
+	flag.BoolVar(&cfg.ModelMapConvert, "model-map-convert", envOrDefault("MODEL_MAP_CONVERT_ENABLED", "true") == "true", "Enable MODEL_MAP in conversion mode")
 	flag.Parse()
+
+	// Parse model mapping from env (supports multi-line JSON)
+	cfg.ModelMap = make(map[string]string)
+	if mm := envOrDefault("MODEL_MAP", ""); mm != "" {
+		if err := json.Unmarshal([]byte(mm), &cfg.ModelMap); err != nil {
+			log.Printf("warning: MODEL_MAP parse error: %v", err)
+		}
+	}
 }
 
 func envOrDefault(key, def string) string {
@@ -125,6 +140,11 @@ func main() {
 	} else {
 		log.Println("  Transparent mode: DISABLED (set TRANSPARENT_ENABLED=true to enable)")
 	}
+	if len(cfg.ModelMap) > 0 {
+		log.Printf("  Model map: %d entries (transparent=%v convert=%v)", len(cfg.ModelMap), cfg.ModelMapTransparent, cfg.ModelMapConvert)
+	} else {
+		log.Println("  Model map: DISABLED (set MODEL_MAP={...} to enable)")
+	}
 	log.Println("")
 	log.Println("  /v1/chat/completions → upstream Responses API")
 	log.Println("  /v1/responses        → upstream Chat Completions API")
@@ -159,25 +179,106 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Load .env file (simple implementation, no external deps)
+// Load .env file (simple implementation, no external deps).
+// Supports multi-line JSON object/array values when value starts with `{` or `[`.
 func loadDotEnv(filename string) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+	src := string(data)
+	i := 0
+	for i < len(src) {
+		// skip whitespace, blank lines, comment lines
+		for i < len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+			i++
+		}
+		if i >= len(src) {
+			break
+		}
+		if src[i] == '#' {
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
 			continue
 		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
+		// parse KEY up to '=' or newline
+		keyStart := i
+		for i < len(src) && src[i] != '=' && src[i] != '\n' {
+			i++
+		}
+		if i >= len(src) || src[i] != '=' {
+			// no '=' on this line — skip
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
 			continue
 		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		// Don't override existing env vars
-		if os.Getenv(key) == "" {
+		key := strings.TrimSpace(src[keyStart:i])
+		i++ // consume '='
+		// skip leading spaces/tabs on value (but NOT newlines)
+		for i < len(src) && (src[i] == ' ' || src[i] == '\t') {
+			i++
+		}
+		valStart := i
+		var val string
+		if i < len(src) && (src[i] == '{' || src[i] == '[') {
+			// Multi-line JSON: scan until matching outer brace/bracket closes.
+			open := src[i]
+			closeCh := byte('}')
+			if open == '[' {
+				closeCh = ']'
+			}
+			depth := 0
+			inStr := false
+			esc := false
+			for i < len(src) {
+				c := src[i]
+				if inStr {
+					switch {
+					case esc:
+						esc = false
+					case c == '\\':
+						esc = true
+					case c == '"':
+						inStr = false
+					}
+				} else {
+					switch c {
+					case '"':
+						inStr = true
+					case open:
+						depth++
+					case closeCh:
+						depth--
+						if depth == 0 {
+							i++
+							goto done
+						}
+					}
+				}
+				i++
+			}
+		done:
+			val = strings.TrimSpace(src[valStart:i])
+			// consume rest of line (trailing comments/whitespace)
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+		} else {
+			// single-line value
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+			val = strings.TrimSpace(src[valStart:i])
+			// strip surrounding quotes
+			if len(val) >= 2 {
+				if (val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'') {
+					val = val[1 : len(val)-1]
+				}
+			}
+		}
+		if key != "" && os.Getenv(key) == "" {
 			os.Setenv(key, val)
 		}
 	}
