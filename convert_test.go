@@ -218,13 +218,76 @@ func TestConvertResponsesToChat_MissingRoleDefaultsToAssistant(t *testing.T) {
 	}
 }
 
+func TestConvertResponsesToChat_DeveloperRoleMapsToSystem(t *testing.T) {
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"developer","content":[{"type":"input_text","text":"Developer note."}]},
+		{"type":"message","id":"msg_2","role":"user","content":[{"type":"input_text","text":"Hello"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	if chatReq.Messages[0].Role != "system" {
+		t.Errorf("msg[0] role = %v, want system", chatReq.Messages[0].Role)
+	}
+	if string(chatReq.Messages[0].Content) != `"Developer note."` {
+		t.Errorf("msg[0] content = %s, want Developer note", chatReq.Messages[0].Content)
+	}
+	if chatReq.Messages[1].Role != "user" {
+		t.Errorf("msg[1] role = %v, want user", chatReq.Messages[1].Role)
+	}
+}
+
+func TestConvertChatToResponses_DeveloperRolePreservedAsInputMessage(t *testing.T) {
+	chatReq := &ChatCompletionsRequest{
+		Model: "gpt-4o",
+		Messages: []ChatMessage{
+			{Role: "developer", Content: json.RawMessage(`"Developer note."`)},
+			{Role: "user", Content: json.RawMessage(`"Hello"`)},
+		},
+	}
+
+	respReq, err := ConvertChatToResponsesRequest(chatReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	if respReq.Instructions != nil {
+		t.Fatalf("instructions = %q, want nil", *respReq.Instructions)
+	}
+
+	var inputs []ResponsesInputMessage
+	if err := json.Unmarshal(respReq.Input, &inputs); err != nil {
+		t.Fatalf("input unmarshal error: %v", err)
+	}
+
+	if len(inputs) != 2 {
+		t.Fatalf("input len = %d, want 2: %+v", len(inputs), inputs)
+	}
+	if inputs[0].Role != "developer" {
+		t.Errorf("input[0] role = %q, want developer", inputs[0].Role)
+	}
+	if string(inputs[0].Content) != `"Developer note."` {
+		t.Errorf("input[0] content = %s, want developer text", inputs[0].Content)
+	}
+	if inputs[1].Role != "user" {
+		t.Errorf("input[1] role = %q, want user", inputs[1].Role)
+	}
+}
+
 func TestConvertChatToResponses_MultipleSystemMessages(t *testing.T) {
 	chatReq := &ChatCompletionsRequest{
 		Model: "gpt-4o",
 		Messages: []ChatMessage{
 			{Role: "system", Content: json.RawMessage(`"System prompt."`)},
 			{Role: "system", Content: json.RawMessage(`"Additional instructions."`)},
-			{Role: "developer", Content: json.RawMessage(`"Developer note."`)},
 			{Role: "user", Content: json.RawMessage(`"Hello"`)},
 		},
 	}
@@ -243,9 +306,6 @@ func TestConvertChatToResponses_MultipleSystemMessages(t *testing.T) {
 	}
 	if !strings.Contains(instructions, "Additional instructions.") {
 		t.Errorf("instructions missing 'Additional instructions.'")
-	}
-	if !strings.Contains(instructions, "Developer note.") {
-		t.Errorf("instructions missing 'Developer note.'")
 	}
 	if !strings.Contains(instructions, "\n\n") {
 		t.Errorf("instructions should be joined with \\n\\n")

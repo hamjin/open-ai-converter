@@ -141,7 +141,7 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesR
 		out.Store = &storeFalse
 	}
 
-	// Extract instructions from system/developer messages
+	// Extract instructions from system messages
 	// (already handled inside convertChatMessagesToResponsesInput)
 
 	if chatReq.MaxCompletionTokens != nil {
@@ -231,18 +231,25 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesR
 }
 
 // convertChatMessagesToResponsesInput converts messages to Responses input items.
-// System/developer messages are collected into instructions.
+// System messages are collected into instructions. Developer messages stay as
+// input items so Responses clients can round-trip the role.
 func convertChatMessagesToResponsesInput(msgs []ChatMessage) ([]ResponsesInputMessage, string, error) {
 	var out []ResponsesInputMessage
 	var instructionsParts []string
 
 	for _, m := range msgs {
 		switch m.Role {
-		case "system", "developer":
+		case "system":
 			text := contentToString(m.Content)
 			if text != "" {
 				instructionsParts = append(instructionsParts, text)
 			}
+		case "developer":
+			out = append(out, ResponsesInputMessage{
+				Type:    "message",
+				Role:    "developer",
+				Content: json.RawMessage(mustMarshal(convertChatContentToResponses(m.Content))),
+			})
 		default:
 			items, err := chatMessageToResponsesItems(m)
 			if err != nil {
@@ -693,6 +700,9 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 						role := im.Role
 						if role == "" {
 							role = "assistant"
+						}
+						if role == "developer" {
+							role = "system"
 						}
 						msg := ChatMessage{Role: role}
 						if im.Content != nil {

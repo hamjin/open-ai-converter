@@ -497,7 +497,7 @@ curl http://localhost:9090/v1/responses \
 | `model` | `model` | 直接映射 |
 | `messages` | `input` | 消息格式互转 |
 | `messages[role=system]` | `instructions` | 系统提示词 |
-| `messages[role=developer]` | `instructions` | 开发者消息 → 指令 |
+| `messages[role=developer]` | `input` | 保留 developer 角色 |
 | `stream` | `stream` | 直接映射 |
 | `max_tokens` | `max_output_tokens` | 名称映射 |
 | `max_completion_tokens` | `max_output_tokens` | 优先使用（更新的字段） |
@@ -567,7 +567,8 @@ curl http://localhost:9090/v1/responses \
 ### Chat Completions → Responses API
 
 ```
-system / developer  →  instructions 字段
+system             →  instructions 字段
+developer          →  { role: "developer", content: ... }
 user                →  { role: "user", content: ... }
 assistant           →  { role: "assistant", content: [{type: "output_text", ...}] }
 assistant (w/ tool_calls)  →  content (if any) + function_call items
