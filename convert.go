@@ -512,6 +512,86 @@ func reorderToolMessages(msgs []ChatMessage) []ChatMessage {
 	return result
 }
 
+// removeOrphanToolMessages drops tool messages whose tool_call_id has no
+// matching assistant tool_calls in scope. This prevents upstream 400 errors
+// from session desyncs, interrupted turns, or partial replays.
+func removeOrphanToolMessages(msgs []ChatMessage) []ChatMessage {
+	// Collect all known tool_call IDs from assistant messages
+	knownIDs := make(map[string]bool)
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				knownIDs[tc.ID] = true
+			}
+		}
+	}
+
+	var result []ChatMessage
+	for _, m := range msgs {
+		if m.Role == "tool" && !knownIDs[m.ToolCallID] {
+			continue // drop orphan
+		}
+		result = append(result, m)
+	}
+	return result
+}
+
+// ensureToolCallsHaveOutputs synthesizes placeholder tool messages for any
+// tool_calls that lack a corresponding function_call_output. This prevents
+// upstream providers (DeepSeek, MiMo) from rejecting the request with
+// "insufficient tool messages following tool_calls message".
+func ensureToolCallsHaveOutputs(msgs []ChatMessage) []ChatMessage {
+	// Collect existing tool_call_ids that have outputs
+	hasOutput := make(map[string]bool)
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			hasOutput[m.ToolCallID] = true
+		}
+	}
+
+	var result []ChatMessage
+	for _, m := range msgs {
+		result = append(result, m)
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				if !hasOutput[tc.ID] {
+					result = append(result, ChatMessage{
+						Role:       "tool",
+						Content:    jsonString("(no output)"),
+						ToolCallID: tc.ID,
+					})
+					hasOutput[tc.ID] = true
+				}
+			}
+		}
+	}
+	return result
+}
+
+// isMiMoModel returns true if the model name indicates a MiMo model.
+func isMiMoModel(model string) bool {
+	return strings.HasPrefix(model, "mimo-")
+}
+
+// applyMiMoCompat applies MiMo-specific fixes to a converted Chat Completions
+// request. MiMo has stricter requirements than OpenAI:
+//   - parallel_tool_calls must be true (otherwise MiMo gives up after 3-4 rounds)
+//   - thinking mode must be enabled for all models except mimo-v2-flash
+//   - non-"auto" tool_choice values are dropped (upstream ignores them)
+func applyMiMoCompat(chatReq *ChatCompletionsRequest) {
+	// Force parallel tool calls
+	trueVal := true
+	chatReq.ParallelToolCalls = &trueVal
+
+	// Drop non-auto tool_choice
+	if chatReq.ToolChoice != nil {
+		var tc string
+		if err := json.Unmarshal(chatReq.ToolChoice, &tc); err == nil && tc != "auto" {
+			chatReq.ToolChoice = nil
+		}
+	}
+}
+
 // ==================== Responses API → Chat Completions (Non-Streaming) ====================
 
 func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletionsResponse, error) {
@@ -638,6 +718,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 	}
 
 	var messages []ChatMessage
+	var hasReasoning bool
 
 	// instructions → system message
 	if respReq.Instructions != nil && *respReq.Instructions != "" {
@@ -665,6 +746,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 
 					switch {
 					case im.Type == "reasoning":
+						hasReasoning = true
 						for _, s := range im.Summary {
 							if s.Type == "summary_text" && s.Text != "" {
 								pendingReasoning += s.Text
@@ -679,8 +761,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 						})
 					case im.Type == "function_call":
 						msg := ChatMessage{
-							Role:    "assistant",
-							Content: json.RawMessage("null"),
+							Role: "assistant",
 							ToolCalls: []ToolCall{{
 								ID:   im.CallID,
 								Type: "function",
@@ -730,7 +811,22 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 			}
 		}
 	}
+	// Defense: clean up orphan tool messages and ensure all tool_calls have outputs
+	messages = removeOrphanToolMessages(messages)
+	messages = ensureToolCallsHaveOutputs(messages)
 	chatReq.Messages = reorderToolMessages(messages)
+
+	// Backfill reasoning_content on historical assistant messages when thinking
+	// mode is active. MiMo and DeepSeek require this on every assistant turn;
+	// without it the model "narrates" instead of following instructions.
+	if hasReasoning {
+		const reasoningPlaceholder = "(this turn ran without thinking mode)"
+		for i := range chatReq.Messages {
+			if chatReq.Messages[i].Role == "assistant" && chatReq.Messages[i].ReasoningContent == "" {
+				chatReq.Messages[i].ReasoningContent = reasoningPlaceholder
+			}
+		}
+	}
 
 	// Parameter mapping
 	if respReq.MaxOutputTokens != nil {

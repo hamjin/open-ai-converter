@@ -336,11 +336,26 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply MiMo-specific fixes when targeting a MiMo model
+	if isMiMoModel(chatReq.Model) {
+		applyMiMoCompat(chatReq)
+	}
+
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {
 		writeError(r, w, http.StatusInternalServerError, "marshal error: "+err.Error())
 		return
 	}
+
+	// Inject thinking mode for MiMo models (except mimo-v2-flash which defaults to disabled)
+	if isMiMoModel(chatReq.Model) && !strings.HasPrefix(chatReq.Model, "mimo-v2-flash") {
+		var bodyMap map[string]interface{}
+		if json.Unmarshal(chatBody, &bodyMap) == nil {
+			bodyMap["thinking"] = map[string]interface{}{"type": "enabled"}
+			chatBody, _ = json.Marshal(bodyMap)
+		}
+	}
+
 	rl.WriteConvertedRequest(chatBody)
 
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
