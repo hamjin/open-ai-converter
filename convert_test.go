@@ -1,10 +1,122 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func useTempReasoningCacheDir(t *testing.T) string {
+	t.Helper()
+
+	oldCacheDir := cfg.CacheDir
+	cacheDir := t.TempDir()
+	cfg.CacheDir = cacheDir
+	resetReasoningCacheForTest()
+
+	t.Cleanup(func() {
+		cfg.CacheDir = oldCacheDir
+		resetReasoningCacheForTest()
+	})
+
+	return cacheDir
+}
+
+func resetReasoningCacheForTest() {
+	evictReasoningCache()
+	reasoningCacheMu.Lock()
+	reasoningCacheLoaded = false
+	reasoningCacheMu.Unlock()
+}
+
+func flushReasoningCacheForTest() {
+	saveReasoningCache()
+	time.Sleep(25 * time.Millisecond)
+}
+
+func assertSQLiteReasoningCacheFile(t *testing.T, cacheDir string) {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(cacheDir, "reasoning_cache.sqlite3"))
+	if err != nil {
+		t.Fatalf("read sqlite reasoning cache: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte("SQLite format 3")) {
+		t.Fatalf("reasoning cache file is not SQLite, header = %q", string(data[:min(len(data), 16)]))
+	}
+}
+
+func TestReasoningCachePersistsToSQLiteByToolCallID(t *testing.T) {
+	cacheDir := useTempReasoningCacheDir(t)
+
+	storeReasoningContent("call_sqlite_primary", "cached reasoning")
+	flushReasoningCacheForTest()
+
+	assertSQLiteReasoningCacheFile(t, cacheDir)
+
+	resetReasoningCacheForTest()
+	if got := getReasoningContent("call_sqlite_primary"); got != "cached reasoning" {
+		t.Fatalf("getReasoningContent() = %q, want cached reasoning", got)
+	}
+	if got := getReasoningContent("unrelated_call"); got != "" {
+		t.Fatalf("unrelated tool_call_id returned %q, want empty", got)
+	}
+}
+
+func TestConvertResponsesToChatRequestInjectsSQLiteReasoningByCallID(t *testing.T) {
+	cacheDir := useTempReasoningCacheDir(t)
+
+	storeReasoningContent("call_for_conversion", "reasoning for conversion")
+	flushReasoningCacheForTest()
+	assertSQLiteReasoningCacheFile(t, cacheDir)
+	resetReasoningCacheForTest()
+
+	respReq := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(`[
+			{"type":"function_call","call_id":"call_for_conversion","name":"do_work","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_for_conversion","output":"done"}
+		]`),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chatReq.Messages) < 1 {
+		t.Fatalf("message count = %d, want at least 1", len(chatReq.Messages))
+	}
+	if got := chatReq.Messages[0].ReasoningContent; got != "reasoning for conversion" {
+		t.Fatalf("reasoning_content = %q, want reasoning for conversion", got)
+	}
+}
+
+func TestReasoningCacheMigratesLegacyJSONToSQLite(t *testing.T) {
+	cacheDir := useTempReasoningCacheDir(t)
+	legacy := map[string]reasoningEntry{
+		"call_legacy": {
+			Content:   "legacy reasoning",
+			CreatedAt: time.Now(),
+		},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "reasoning_cache.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := getReasoningContent("call_legacy"); got != "legacy reasoning" {
+		t.Fatalf("getReasoningContent() = %q, want legacy reasoning", got)
+	}
+	flushReasoningCacheForTest()
+	assertSQLiteReasoningCacheFile(t, cacheDir)
+}
 
 func TestConvertChatToResponses_MultiTurnWithToolCalls(t *testing.T) {
 	chatReq := &ChatCompletionsRequest{
@@ -748,9 +860,9 @@ func TestConvertResponsesToChat_StreamOptions(t *testing.T) {
 func TestConvertChatToResponses_MaxTokensClamped(t *testing.T) {
 	maxTokens := 50
 	req := &ChatCompletionsRequest{
-		Model:      "gpt-4",
-		MaxTokens:  &maxTokens,
-		Messages:   []ChatMessage{{Role: "user", Content: jsonString("hello")}},
+		Model:     "gpt-4",
+		MaxTokens: &maxTokens,
+		Messages:  []ChatMessage{{Role: "user", Content: jsonString("hello")}},
 	}
 	respReq, err := ConvertChatToResponsesRequest(req)
 	if err != nil {
@@ -765,9 +877,9 @@ func TestConvertChatToResponses_MaxTokensClamped(t *testing.T) {
 func TestConvertChatToResponses_ReasoningEffort(t *testing.T) {
 	effort := "high"
 	req := &ChatCompletionsRequest{
-		Model:          "o3",
+		Model:           "o3",
 		ReasoningEffort: &effort,
-		Messages:       []ChatMessage{{Role: "user", Content: jsonString("hello")}},
+		Messages:        []ChatMessage{{Role: "user", Content: jsonString("hello")}},
 	}
 	respReq, err := ConvertChatToResponsesRequest(req)
 	if err != nil {
@@ -894,8 +1006,8 @@ func TestConvertResponsesRespToChatResp_WebSearchCallFiltered(t *testing.T) {
 		Status: "completed",
 		Output: []OutputItem{
 			{
-				Type:  "web_search_call",
-				ID:    "ws_1",
+				Type:   "web_search_call",
+				ID:     "ws_1",
 				Action: &WebSearchAction{Type: "search", Query: "test"},
 			},
 			{

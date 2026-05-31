@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,25 +11,75 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // reasoningCache stores reasoning_content from upstream responses, keyed by tool_call ID.
-// Persisted to disk in conversations/reasoning_cache.json, retained for 7 days.
+// Persisted to disk in a pure-Go SQLite database, retained for 7 days.
 type reasoningEntry struct {
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 var (
-	reasoningCache   sync.Map
-	reasoningCacheMu sync.Mutex
+	reasoningCache       sync.Map
+	reasoningCacheMu     sync.Mutex
 	reasoningCacheLoaded bool
 )
 
 const reasoningCacheTTL = 7 * 24 * time.Hour
 
 func reasoningCachePath() string {
+	return filepath.Join(cfg.CacheDir, "reasoning_cache.sqlite3")
+}
+
+func legacyReasoningCachePath() string {
 	return filepath.Join(cfg.CacheDir, "reasoning_cache.json")
+}
+
+func openReasoningCacheDB() (*sql.DB, error) {
+	if err := os.MkdirAll(cfg.CacheDir, 0755); err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite", reasoningCachePath())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`PRAGMA synchronous = NORMAL`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS reasoning_cache (
+			tool_call_id TEXT PRIMARY KEY NOT NULL,
+			content TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_reasoning_cache_created_at
+		ON reasoning_cache(created_at)
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return db, nil
 }
 
 func loadReasoningCache() {
@@ -39,28 +90,130 @@ func loadReasoningCache() {
 	}
 	reasoningCacheLoaded = true
 
-	data, err := os.ReadFile(reasoningCachePath())
+	now := time.Now()
+	db, err := openReasoningCacheDB()
 	if err != nil {
+		log.Printf("[cache] open reasoning cache db failed: %v", err)
+		loadLegacyReasoningCacheLocked(nil, now)
 		return
 	}
+	defer db.Close()
+
+	loaded := loadSQLiteReasoningCacheLocked(db, now)
+	migrated := loadLegacyReasoningCacheLocked(db, now)
+	log.Printf("[cache] loaded %d reasoning entries from sqlite, migrated %d legacy entries", loaded, migrated)
+}
+
+func loadSQLiteReasoningCacheLocked(db *sql.DB, now time.Time) int {
+	cutoff := now.Add(-reasoningCacheTTL).UnixNano()
+	if _, err := db.Exec(`DELETE FROM reasoning_cache WHERE created_at < ?`, cutoff); err != nil {
+		log.Printf("[cache] prune reasoning cache failed: %v", err)
+	}
+
+	rows, err := db.Query(`
+		SELECT tool_call_id, content, created_at
+		FROM reasoning_cache
+		WHERE created_at >= ?
+	`, cutoff)
+	if err != nil {
+		log.Printf("[cache] load reasoning cache failed: %v", err)
+		return 0
+	}
+	defer rows.Close()
+
+	loaded := 0
+	for rows.Next() {
+		var toolCallID string
+		var content string
+		var createdAtUnixNano int64
+		if err := rows.Scan(&toolCallID, &content, &createdAtUnixNano); err != nil {
+			log.Printf("[cache] scan reasoning cache failed: %v", err)
+			continue
+		}
+		if toolCallID == "" || content == "" {
+			continue
+		}
+		reasoningCache.Store(toolCallID, reasoningEntry{
+			Content:   content,
+			CreatedAt: time.Unix(0, createdAtUnixNano),
+		})
+		loaded++
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[cache] iterate reasoning cache failed: %v", err)
+	}
+	return loaded
+}
+
+func loadLegacyReasoningCacheLocked(db *sql.DB, now time.Time) int {
+	data, err := os.ReadFile(legacyReasoningCachePath())
+	if err != nil {
+		return 0
+	}
+
 	var entries map[string]reasoningEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
-		return
+		log.Printf("[cache] parse legacy reasoning cache failed: %v", err)
+		return 0
 	}
-	now := time.Now()
+
+	migrated := 0
 	for k, v := range entries {
+		if k == "" || v.Content == "" {
+			continue
+		}
 		if now.Sub(v.CreatedAt) < reasoningCacheTTL {
+			if _, exists := reasoningCache.Load(k); exists {
+				continue
+			}
 			reasoningCache.Store(k, v)
+			if db != nil {
+				if err := upsertReasoningEntryLocked(db, k, v); err != nil {
+					log.Printf("[cache] migrate legacy reasoning entry failed: %v", err)
+				}
+			}
+			migrated++
 		}
 	}
-	log.Printf("[cache] loaded %d reasoning entries from disk", len(entries))
+	return migrated
 }
 
 func saveReasoningCache() {
 	reasoningCacheMu.Lock()
 	defer reasoningCacheMu.Unlock()
 
-	entries := make(map[string]reasoningEntry)
+	db, err := openReasoningCacheDB()
+	if err != nil {
+		log.Printf("[cache] open reasoning cache db failed: %v", err)
+		return
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("[cache] begin reasoning cache save failed: %v", err)
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM reasoning_cache`); err != nil {
+		log.Printf("[cache] clear reasoning cache failed: %v", err)
+		return
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO reasoning_cache (tool_call_id, content, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(tool_call_id) DO UPDATE SET
+			content = excluded.content,
+			created_at = excluded.created_at
+	`)
+	if err != nil {
+		log.Printf("[cache] prepare reasoning cache save failed: %v", err)
+		return
+	}
+	defer stmt.Close()
+
 	now := time.Now()
 	reasoningCache.Range(func(k, v any) bool {
 		key, _ := k.(string)
@@ -68,24 +221,30 @@ func saveReasoningCache() {
 		if !ok {
 			return true
 		}
+		if key == "" || entry.Content == "" {
+			return true
+		}
 		if now.Sub(entry.CreatedAt) < reasoningCacheTTL {
-			entries[key] = entry
+			if _, err := stmt.Exec(key, entry.Content, entry.CreatedAt.UnixNano()); err != nil {
+				log.Printf("[cache] save reasoning entry failed: %v", err)
+			}
 		}
 		return true
 	})
 
-	data, _ := json.Marshal(entries)
-	os.MkdirAll(cfg.CacheDir, 0755)
-	os.WriteFile(reasoningCachePath(), data, 0644)
+	if err := tx.Commit(); err != nil {
+		log.Printf("[cache] commit reasoning cache save failed: %v", err)
+	}
 }
 
 func storeReasoningContent(toolCallID, content string) {
 	if toolCallID != "" && content != "" {
-		reasoningCache.Store(toolCallID, reasoningEntry{
+		entry := reasoningEntry{
 			Content:   content,
 			CreatedAt: time.Now(),
-		})
-		go saveReasoningCache()
+		}
+		reasoningCache.Store(toolCallID, entry)
+		go saveReasoningEntry(toolCallID, entry)
 	}
 }
 
@@ -97,8 +256,63 @@ func getReasoningContent(toolCallID string) string {
 			return entry.Content
 		}
 		reasoningCache.Delete(toolCallID)
+		go deleteReasoningEntry(toolCallID)
 	}
 	return ""
+}
+
+func saveReasoningEntry(toolCallID string, entry reasoningEntry) {
+	reasoningCacheMu.Lock()
+	defer reasoningCacheMu.Unlock()
+
+	db, err := openReasoningCacheDB()
+	if err != nil {
+		log.Printf("[cache] open reasoning cache db failed: %v", err)
+		return
+	}
+	defer db.Close()
+
+	if time.Since(entry.CreatedAt) >= reasoningCacheTTL {
+		if err := deleteReasoningEntryLocked(db, toolCallID); err != nil {
+			log.Printf("[cache] delete expired reasoning entry failed: %v", err)
+		}
+		return
+	}
+	if err := upsertReasoningEntryLocked(db, toolCallID, entry); err != nil {
+		log.Printf("[cache] save reasoning entry failed: %v", err)
+	}
+}
+
+func upsertReasoningEntryLocked(db *sql.DB, toolCallID string, entry reasoningEntry) error {
+	_, err := db.Exec(`
+		INSERT INTO reasoning_cache (tool_call_id, content, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(tool_call_id) DO UPDATE SET
+			content = excluded.content,
+			created_at = excluded.created_at
+	`, toolCallID, entry.Content, entry.CreatedAt.UnixNano())
+	return err
+}
+
+func deleteReasoningEntry(toolCallID string) {
+	reasoningCacheMu.Lock()
+	defer reasoningCacheMu.Unlock()
+
+	db, err := openReasoningCacheDB()
+	if err != nil {
+		log.Printf("[cache] open reasoning cache db failed: %v", err)
+		return
+	}
+	defer db.Close()
+
+	if err := deleteReasoningEntryLocked(db, toolCallID); err != nil {
+		log.Printf("[cache] delete reasoning entry failed: %v", err)
+	}
+}
+
+func deleteReasoningEntryLocked(db *sql.DB, toolCallID string) error {
+	_, err := db.Exec(`DELETE FROM reasoning_cache WHERE tool_call_id = ?`, toolCallID)
+	return err
 }
 
 func evictReasoningCache() {
@@ -122,12 +336,12 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesR
 	}
 
 	out := &ResponsesRequest{
-		Model:        chatReq.Model,
-		Input:        inputJSON,
-		Temperature:  chatReq.Temperature,
-		TopP:         chatReq.TopP,
-		Stream:       chatReq.Stream,
-		ServiceTier:  chatReq.ServiceTier,
+		Model:       chatReq.Model,
+		Input:       inputJSON,
+		Temperature: chatReq.Temperature,
+		TopP:        chatReq.TopP,
+		Stream:      chatReq.Stream,
+		ServiceTier: chatReq.ServiceTier,
 	}
 
 	if instructions != "" {
@@ -1065,9 +1279,9 @@ func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesE
 
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
 		ToolCalls: []ToolCall{{
-			Index: &idx,
-			ID:    evt.Item.CallID,
-			Type:  "function",
+			Index:    &idx,
+			ID:       evt.Item.CallID,
+			Type:     "function",
 			Function: FunctionCall{Name: evt.Item.Name},
 		}},
 	})}
@@ -1083,7 +1297,7 @@ func resToChatHandleFuncArgsDelta(evt *ResponsesStreamEvent, state *ResponsesEve
 	}
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
 		ToolCalls: []ToolCall{{
-			Index: &idx,
+			Index:    &idx,
 			Function: FunctionCall{Arguments: evt.Delta},
 		}},
 	})}
@@ -1157,8 +1371,8 @@ func makeChatFinishChunk(state *ResponsesEventToChatState, finishReason string) 
 		ID: state.ID, Object: "chat.completion.chunk",
 		Created: state.Created, Model: state.Model,
 		Choices: []ChatChunkChoice{{
-			Index: 0,
-			Delta: ChatDelta{Content: &empty},
+			Index:        0,
+			Delta:        ChatDelta{Content: &empty},
 			FinishReason: &finishReason,
 		}},
 	}
