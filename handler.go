@@ -1169,7 +1169,8 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 // ==================== Transparent Pass-through ====================
 
 func handleTransparent(w http.ResponseWriter, r *http.Request) {
-	apiKey := resolveAPIKey(r, cfg.ResponsesAPIKey, cfg.APIKeyPassthroughTransparent && cfg.APIKeyPassthroughResponsesAPI)
+	upstreamBaseURL, upstreamKey, passthrough := transparentUpstreamConfigForPath(r.URL.Path)
+	apiKey := resolveAPIKey(r, upstreamKey, passthrough)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1178,7 +1179,7 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	upstreamURL := cfg.ResponsesAPIBaseURL + r.URL.Path
+	upstreamURL := upstreamBaseURL + r.URL.Path
 	if r.URL.RawQuery != "" {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
@@ -1271,6 +1272,15 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBody)
+}
+
+func transparentUpstreamConfigForPath(path string) (baseURL, apiKey string, passthrough bool) {
+	switch path {
+	case "/v1/responses":
+		return cfg.CompletionsAPIBaseURL, cfg.CompletionsAPIKey, cfg.APIKeyPassthroughTransparent && cfg.APIKeyPassthroughCompletionsAPI
+	default:
+		return cfg.ResponsesAPIBaseURL, cfg.ResponsesAPIKey, cfg.APIKeyPassthroughTransparent && cfg.APIKeyPassthroughResponsesAPI
+	}
 }
 
 // ==================== Utilities ====================

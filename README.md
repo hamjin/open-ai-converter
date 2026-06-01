@@ -106,6 +106,9 @@ docker run -d --name openai-converter \
 | `COMPLETIONS_API_KEY` | 上游 Chat Completions API 密钥 | — |
 | `HOST` | 监听地址 | `0.0.0.0` |
 | `PORT` | 监听端口 | `9090` |
+| `TRANSPARENT_CHAT_COMPLETIONS_ENABLED` | `/v1/chat/completions` 透明透传开关，启用后不转换，直接请求方向1上游（`RESPONSES_API_BASE_URL`） | `false` |
+| `TRANSPARENT_RESPONSES_ENABLED` | `/v1/responses` 透明透传开关，启用后不转换，直接请求方向2上游（`COMPLETIONS_API_BASE_URL`） | `false` |
+| `TRANSPARENT_ENABLED` | 旧版兼容总开关；仅当两个端点专用变量未设置时作为默认值 | `false` |
 
 也支持命令行参数：
 
@@ -642,6 +645,7 @@ OPENAI_CONVERTER/
 
 - **方向1** (`/v1/chat/completions`)：使用客户端提供的 key 或 fallback 到 `RESPONSES_API_KEY`
 - **方向2** (`/v1/responses`)：使用客户端提供的 key 或 fallback 到 `COMPLETIONS_API_KEY`
+- **透明模式**：`/v1/chat/completions` 透传到方向1上游 `RESPONSES_API_BASE_URL` / `RESPONSES_API_KEY`，`/v1/responses` 透传到方向2上游 `COMPLETIONS_API_BASE_URL` / `COMPLETIONS_API_KEY`
 
 这使得代理可以：
 1. 作为透明代理，让客户端使用自己的 key

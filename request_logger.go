@@ -536,7 +536,7 @@ func conversationLoggingMiddleware(next http.Handler) http.Handler {
 
 		dir := cfg.ConvertLogDir
 		direction := "convert"
-		if cfg.TransparentEnabled {
+		if transparentEnabledForPath(r.URL.Path) {
 			dir = cfg.TransparentLogDir
 			direction = "transparent"
 		}

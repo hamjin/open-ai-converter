@@ -28,7 +28,8 @@ type Config struct {
 	ConvertLogDir     string
 	TransparentLogDir string
 
-	TransparentEnabled bool
+	TransparentChatCompletionsEnabled bool
+	TransparentResponsesEnabled       bool
 
 	ModelMap            map[string]string
 	ModelMapTransparent bool
@@ -61,7 +62,11 @@ func loadConfig() {
 	flag.BoolVar(&cfg.LogEnabled, "log-enabled", envOrDefault("LOG_ENABLED", "false") == "true", "Enable request/response logging to files (false = console summary only)")
 	flag.StringVar(&cfg.ConvertLogDir, "convert-log-dir", envOrDefault("CONVERT_LOG_DIR", "conversations"), "Directory for conversion-mode request/response logs")
 	flag.StringVar(&cfg.TransparentLogDir, "transparent-log-dir", envOrDefault("TRANSPARENT_LOG_DIR", "conversations_t"), "Directory for transparent-mode request/response logs")
-	flag.BoolVar(&cfg.TransparentEnabled, "transparent", envOrDefault("TRANSPARENT_ENABLED", "false") == "true", "Enable transparent pass-through mode (no conversion)")
+	legacyTransparentEnabled := envOrDefault("TRANSPARENT_ENABLED", "false")
+	legacyTransparentFlag := legacyTransparentEnabled == "true"
+	flag.BoolVar(&legacyTransparentFlag, "transparent", legacyTransparentFlag, "Deprecated: enable transparent pass-through for both /v1/chat/completions and /v1/responses")
+	flag.BoolVar(&cfg.TransparentChatCompletionsEnabled, "transparent-chat-completions", envOrDefault("TRANSPARENT_CHAT_COMPLETIONS_ENABLED", legacyTransparentEnabled) == "true", "Enable transparent pass-through for /v1/chat/completions")
+	flag.BoolVar(&cfg.TransparentResponsesEnabled, "transparent-responses", envOrDefault("TRANSPARENT_RESPONSES_ENABLED", legacyTransparentEnabled) == "true", "Enable transparent pass-through for /v1/responses")
 	flag.BoolVar(&cfg.ModelMapTransparent, "model-map-transparent", envOrDefault("MODEL_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable MODEL_MAP in transparent pass-through mode")
 	flag.BoolVar(&cfg.ModelMapConvert, "model-map-convert", envOrDefault("MODEL_MAP_CONVERT_ENABLED", "true") == "true", "Enable MODEL_MAP in conversion mode")
 	flag.BoolVar(&cfg.ReasoningEffortMapTransparent, "reasoning-effort-map-transparent", envOrDefault("REASONING_EFFORT_MAP_TRANSPARENT_ENABLED", "true") == "true", "Enable REASONING_EFFORT_MAP in transparent pass-through mode")
@@ -71,6 +76,28 @@ func loadConfig() {
 	flag.BoolVar(&cfg.APIKeyPassthroughResponsesAPI, "api-key-passthrough-responses", envOrDefault("API_KEY_PASSTHROUGH_RESPONSES_ENABLED", "true") == "true", "Pass client Authorization through to upstream Responses API (false = always use configured key)")
 	flag.BoolVar(&cfg.APIKeyPassthroughCompletionsAPI, "api-key-passthrough-completions", envOrDefault("API_KEY_PASSTHROUGH_COMPLETIONS_ENABLED", "true") == "true", "Pass client Authorization through to upstream Chat Completions API (false = always use configured key)")
 	flag.Parse()
+
+	legacyTransparentFlagSet := false
+	transparentChatFlagSet := false
+	transparentResponsesFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "transparent":
+			legacyTransparentFlagSet = true
+		case "transparent-chat-completions":
+			transparentChatFlagSet = true
+		case "transparent-responses":
+			transparentResponsesFlagSet = true
+		}
+	})
+	if legacyTransparentFlagSet {
+		if !transparentChatFlagSet {
+			cfg.TransparentChatCompletionsEnabled = legacyTransparentFlag
+		}
+		if !transparentResponsesFlagSet {
+			cfg.TransparentResponsesEnabled = legacyTransparentFlag
+		}
+	}
 
 	// Parse model mapping from env (supports multi-line JSON)
 	cfg.ModelMap = make(map[string]string)
@@ -107,6 +134,17 @@ func envIntOrDefault(key string, def int) int {
 	return def
 }
 
+func transparentEnabledForPath(path string) bool {
+	switch path {
+	case "/v1/chat/completions":
+		return cfg.TransparentChatCompletionsEnabled
+	case "/v1/responses":
+		return cfg.TransparentResponsesEnabled
+	default:
+		return false
+	}
+}
+
 func main() {
 	// Load .env file if present
 	loadDotEnv(".env")
@@ -115,14 +153,14 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Direction 1: Client speaks Chat Completions, proxy converts to Responses API
-	if cfg.TransparentEnabled {
+	if transparentEnabledForPath("/v1/chat/completions") {
 		mux.HandleFunc("/v1/chat/completions", handleTransparent)
 	} else {
 		mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
 	}
 
 	// Direction 2: Client speaks Responses, proxy converts to Chat Completions API
-	if cfg.TransparentEnabled {
+	if transparentEnabledForPath("/v1/responses") {
 		mux.HandleFunc("/v1/responses", handleTransparent)
 	} else {
 		mux.HandleFunc("/v1/responses", handleResponses)
@@ -175,10 +213,10 @@ func main() {
 	} else {
 		log.Println("  Request logging: DISABLED (set LOG_ENABLED=true to enable)")
 	}
-	if cfg.TransparentEnabled {
-		log.Printf("  Transparent mode: ENABLED")
+	if cfg.TransparentChatCompletionsEnabled || cfg.TransparentResponsesEnabled {
+		log.Printf("  Transparent mode: chat_completions=%v responses=%v", cfg.TransparentChatCompletionsEnabled, cfg.TransparentResponsesEnabled)
 	} else {
-		log.Println("  Transparent mode: DISABLED (set TRANSPARENT_ENABLED=true to enable)")
+		log.Println("  Transparent mode: DISABLED (set TRANSPARENT_CHAT_COMPLETIONS_ENABLED=true or TRANSPARENT_RESPONSES_ENABLED=true to enable)")
 	}
 	if len(cfg.ModelMap) > 0 {
 		log.Printf("  Model map: %d entries (transparent=%v convert=%v)", len(cfg.ModelMap), cfg.ModelMapTransparent, cfg.ModelMapConvert)
