@@ -1129,10 +1129,8 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	prepareUpstreamRequest(req, r)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	if ct := r.Header.Get("Content-Type"); ct != "" {
-		req.Header.Set("Content-Type", ct)
-	}
 
 	// Forward client IP
 	clientIP := r.RemoteAddr
@@ -1222,13 +1220,8 @@ func handleTransparent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	prepareUpstreamRequest(req, r)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	if ct := r.Header.Get("Content-Type"); ct != "" {
-		req.Header.Set("Content-Type", ct)
-	}
-	if r.Header.Get("Accept") != "" {
-		req.Header.Set("Accept", r.Header.Get("Accept"))
-	}
 
 	clientIP := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(clientIP); err == nil {
@@ -1309,6 +1302,7 @@ func doUpstreamRequest(origReq *http.Request, url, apiKey string, body []byte, s
 	if err != nil {
 		return nil, err
 	}
+	prepareUpstreamRequest(req, origReq)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	if streaming {
@@ -1349,6 +1343,34 @@ func doUpstreamRequest(origReq *http.Request, url, apiKey string, body []byte, s
 		resp.Body = rl.NewUpstreamBodyTeeCloser(resp.Body, resp.StatusCode, streaming)
 	}
 	return resp, err
+}
+
+func prepareUpstreamRequest(req *http.Request, origReq *http.Request) {
+	if req == nil {
+		return
+	}
+	if origReq != nil {
+		for k, values := range origReq.Header {
+			if !forwardUpstreamRequestHeader(k) {
+				continue
+			}
+			for _, value := range values {
+				req.Header.Add(k, value)
+			}
+		}
+	}
+	req.Host = req.URL.Host
+	req.Header.Del("Host")
+	req.Header.Set("Accept-Encoding", "identity")
+}
+
+func forwardUpstreamRequestHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Host", "Accept-Encoding":
+		return false
+	default:
+		return true
+	}
 }
 
 func extractAPIKey(r *http.Request) string {
