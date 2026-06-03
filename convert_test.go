@@ -19,6 +19,7 @@ func useTempReasoningCacheDir(t *testing.T) string {
 	resetReasoningCacheForTest()
 
 	t.Cleanup(func() {
+		flushReasoningCacheForTest()
 		cfg.CacheDir = oldCacheDir
 		resetReasoningCacheForTest()
 	})
@@ -92,6 +93,74 @@ func TestConvertResponsesToChatRequestInjectsSQLiteReasoningByCallID(t *testing.
 	}
 	if got := chatReq.Messages[0].ReasoningContent; got != "reasoning for conversion" {
 		t.Fatalf("reasoning_content = %q, want reasoning for conversion", got)
+	}
+}
+
+func TestConvertResponsesToChatRequestUsesExplicitReasoningForFollowingToolCalls(t *testing.T) {
+	useTempReasoningCacheDir(t)
+
+	respReq := &ResponsesRequest{
+		Model: "mimo",
+		Input: json.RawMessage(`[
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"need both tools"}]},
+			{"type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{}"},
+			{"type":"function_call","call_id":"call_time","name":"get_time","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_weather","output":"sunny"},
+			{"type":"function_call_output","call_id":"call_time","output":"10:00"}
+		]`),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for _, msg := range chatReq.Messages {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			got = append(got, msg.ReasoningContent)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("assistant tool-call messages = %d, want 2", len(got))
+	}
+	for i, rc := range got {
+		if rc != "need both tools" {
+			t.Fatalf("assistant tool-call message %d reasoning_content = %q, want need both tools", i, rc)
+		}
+	}
+	if cached := getReasoningContent("call_weather"); cached != "need both tools" {
+		t.Fatalf("cached call_weather reasoning = %q, want need both tools", cached)
+	}
+	flushReasoningCacheForTest()
+}
+
+func TestConvertResponsesToChatRequestPrefersConversationScopedReasoningCache(t *testing.T) {
+	useTempReasoningCacheDir(t)
+
+	previousResponseID := "resp_conversation_a"
+	storeReasoningContentForConversation(previousResponseID, "call_reused", "conversation scoped reasoning")
+	storeReasoningContent("call_reused", "unscoped reasoning")
+	flushReasoningCacheForTest()
+
+	respReq := &ResponsesRequest{
+		Model:              "mimo",
+		PreviousResponseID: &previousResponseID,
+		Input: json.RawMessage(`[
+			{"type":"function_call","call_id":"call_reused","name":"do_work","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_reused","output":"done"}
+		]`),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chatReq.Messages) < 1 {
+		t.Fatalf("message count = %d, want at least 1", len(chatReq.Messages))
+	}
+	if got := chatReq.Messages[0].ReasoningContent; got != "conversation scoped reasoning" {
+		t.Fatalf("reasoning_content = %q, want conversation scoped reasoning", got)
 	}
 }
 

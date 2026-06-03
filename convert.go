@@ -16,6 +16,8 @@ import (
 )
 
 // reasoningCache stores reasoning_content from upstream responses, keyed by tool_call ID.
+// When a conversation ID is available, a scoped key is written as an auxiliary
+// entry so repeated tool_call IDs across conversations do not collide.
 // Persisted to disk in a pure-Go SQLite database, retained for 7 days.
 type reasoningEntry struct {
 	Content   string    `json:"content"`
@@ -29,6 +31,14 @@ var (
 )
 
 const reasoningCacheTTL = 7 * 24 * time.Hour
+const reasoningCacheKeySeparator = "\x1f"
+
+func reasoningCacheKey(conversationID, toolCallID string) string {
+	if conversationID == "" {
+		return toolCallID
+	}
+	return conversationID + reasoningCacheKeySeparator + toolCallID
+}
 
 func reasoningCachePath() string {
 	return filepath.Join(cfg.CacheDir, "reasoning_cache.sqlite3")
@@ -238,25 +248,82 @@ func saveReasoningCache() {
 }
 
 func storeReasoningContent(toolCallID, content string) {
-	if toolCallID != "" && content != "" {
-		entry := reasoningEntry{
-			Content:   content,
-			CreatedAt: time.Now(),
-		}
-		reasoningCache.Store(toolCallID, entry)
-		go saveReasoningEntry(toolCallID, entry)
+	storeReasoningContentForConversation("", toolCallID, content)
+}
+
+func storeReasoningContentForConversation(conversationID, toolCallID, content string) {
+	if toolCallID == "" || content == "" {
+		return
+	}
+	entry := reasoningEntry{
+		Content:   content,
+		CreatedAt: time.Now(),
+	}
+	storeReasoningEntry(reasoningCacheKey("", toolCallID), entry)
+	if conversationID != "" {
+		storeReasoningEntry(reasoningCacheKey(conversationID, toolCallID), entry)
 	}
 }
 
+func storeReasoningEntry(cacheKey string, entry reasoningEntry) {
+	reasoningCache.Store(cacheKey, entry)
+	go saveReasoningEntry(cacheKey, entry)
+}
+
 func getReasoningContent(toolCallID string) string {
+	return getReasoningContentByCacheKey(toolCallID)
+}
+
+func getReasoningContentForConversation(conversationID, toolCallID string) string {
+	if conversationID != "" {
+		if content := getReasoningContentByCacheKey(reasoningCacheKey(conversationID, toolCallID)); content != "" {
+			return content
+		}
+	}
+	return getReasoningContentByCacheKey(toolCallID)
+}
+
+func getReasoningContentByCacheKey(cacheKey string) string {
 	loadReasoningCache()
-	if v, ok := reasoningCache.Load(toolCallID); ok {
+	if v, ok := reasoningCache.Load(cacheKey); ok {
 		entry, _ := v.(reasoningEntry)
 		if time.Since(entry.CreatedAt) < reasoningCacheTTL {
 			return entry.Content
 		}
-		reasoningCache.Delete(toolCallID)
-		go deleteReasoningEntry(toolCallID)
+		reasoningCache.Delete(cacheKey)
+		go deleteReasoningEntry(cacheKey)
+	}
+	return ""
+}
+
+func responseConversationID(respReq *ResponsesRequest) string {
+	if respReq == nil {
+		return ""
+	}
+	if respReq.PreviousResponseID != nil && *respReq.PreviousResponseID != "" {
+		return *respReq.PreviousResponseID
+	}
+	if respReq.Metadata == nil {
+		return ""
+	}
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(respReq.Metadata, &metadata); err != nil {
+		return ""
+	}
+	for _, key := range []string{
+		"conversation_id",
+		"conversationId",
+		"conversation",
+		"session_id",
+		"sessionId",
+		"thread_id",
+		"threadId",
+		"chat_id",
+		"chatId",
+	} {
+		if v, ok := metadata[key].(string); ok && v != "" {
+			return v
+		}
 	}
 	return ""
 }
@@ -852,6 +919,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 	}
 
 	var messages []ChatMessage
+	conversationID := responseConversationID(respReq)
 
 	// instructions → system message
 	if respReq.Instructions != nil && *respReq.Instructions != "" {
@@ -886,6 +954,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 						}
 						continue
 					case im.Type == "function_call_output":
+						pendingReasoning = ""
 						messages = append(messages, ChatMessage{
 							Role:       "tool",
 							Content:    jsonString(im.Output),
@@ -904,10 +973,14 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 								},
 							}},
 						}
-						// Inject cached reasoning_content from previous upstream response.
-						// Some APIs require this field to be present (even empty) in thinking mode.
-						if rc := getReasoningContent(im.CallID); rc != "" {
-							msg.ReasoningContent = rc
+						// Prefer explicit Responses reasoning input; fall back to cache.
+						reasoning := pendingReasoning
+						if reasoning == "" {
+							reasoning = getReasoningContentForConversation(conversationID, im.CallID)
+						}
+						if reasoning != "" {
+							msg.ReasoningContent = reasoning
+							storeReasoningContentForConversation(conversationID, im.CallID, reasoning)
 						}
 						messages = append(messages, msg)
 					default:
@@ -937,6 +1010,12 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 									}
 								}
 							}
+						}
+						if role == "assistant" && pendingReasoning != "" {
+							msg.ReasoningContent = pendingReasoning
+							pendingReasoning = ""
+						} else if role != "assistant" {
+							pendingReasoning = ""
 						}
 						messages = append(messages, msg)
 					}

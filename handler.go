@@ -345,14 +345,15 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
 
+	conversationID := responseConversationID(&respReq)
 	if respReq.Stream {
-		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, respReq.Model, respReq.Model)
+		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, respReq.Model, respReq.Model, conversationID)
 	} else {
-		handleResponsesNonStream(r, w, upstreamURL, apiKey, chatBody, respReq.Model)
+		handleResponsesNonStream(r, w, upstreamURL, apiKey, chatBody, respReq.Model, conversationID)
 	}
 }
 
-func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, originalModel string) {
+func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, originalModel string, conversationID string) {
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, false)
 	if err != nil {
 		writeError(r, w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -385,7 +386,7 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 		if choice.Message != nil && choice.Message.ReasoningContent != "" {
 			reasoningContent = choice.Message.ReasoningContent
 			for _, tc := range choice.Message.ToolCalls {
-				storeReasoningContent(tc.ID, choice.Message.ReasoningContent)
+				storeReasoningContentForConversation(conversationID, tc.ID, choice.Message.ReasoningContent)
 			}
 		}
 	}
@@ -410,7 +411,7 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 	json.NewEncoder(w).Encode(responsesResp)
 }
 
-func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string, originalModel string) {
+func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string, originalModel string, conversationID string) {
 	model = originalModel // Use client model in all responses
 
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
@@ -443,6 +444,9 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			for _, choice := range chatResp.Choices {
 				if choice.Message != nil && choice.Message.ReasoningContent != "" {
 					reasoningContent = choice.Message.ReasoningContent
+					for _, tc := range choice.Message.ToolCalls {
+						storeReasoningContentForConversation(conversationID, tc.ID, choice.Message.ReasoningContent)
+					}
 				}
 			}
 			var partial struct {
@@ -831,6 +835,9 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			for _, choice := range chatResp.Choices {
 				if choice.Message != nil && choice.Message.ReasoningContent != "" {
 					reasoningContent = choice.Message.ReasoningContent
+					for _, tc := range choice.Message.ToolCalls {
+						storeReasoningContentForConversation(conversationID, tc.ID, choice.Message.ReasoningContent)
+					}
 				}
 			}
 			var partial struct {
@@ -913,7 +920,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	if fullReasoning.Len() > 0 {
 		rc := fullReasoning.String()
 		for _, tc := range toolCalls {
-			storeReasoningContent(tc.ID, rc)
+			storeReasoningContentForConversation(conversationID, tc.ID, rc)
 		}
 
 		// Finalize reasoning if NO text content was received (reasoning-only response)
